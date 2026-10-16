@@ -1,0 +1,47 @@
+[Unit]
+Description=Subscription collector and tester (subsvc)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=subsvc
+Group=subsvc
+ExecStart=/usr/local/bin/subsvc -config /etc/subsvc/config.json
+Restart=on-failure
+RestartSec=3
+
+# Data directory: /var/lib/subsvc (created automatically, owned by the service user)
+StateDirectory=subsvc
+StateDirectoryMode=0750
+
+# Resource limits for a 2-core / 2 GB machine
+Nice=5
+MemoryHigh=768M
+MemoryMax=1G
+TasksMax=256
+LimitNOFILE=8192
+
+# systemd stops the whole control group on stop/restart, so no proxy-core
+# process can outlive the service.
+KillMode=control-group
+TimeoutStopSec=15
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

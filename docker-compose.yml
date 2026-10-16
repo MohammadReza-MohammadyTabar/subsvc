@@ -1,0 +1,26 @@
+services:
+  subsvc:
+    build: ./subsvc
+    container_name: subsvc
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.json:/etc/subsvc/config.json:ro
+      - subsvc-data:/var/lib/subsvc
+
+  subsvc-ui:
+    build: ./subsvc-ui
+    container_name: subsvc-ui
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    environment:
+      - SUBSC_BACKEND=http://subsvc:8080
+      - SUBSC_OUTPUT_NAME=LONG LIVE ISLAMIC REPUBLIC OF IRAN
+      - SUBSC_OUTPUT_NUMBERED=true
+    depends_on:
+      - subsvc
+
+volumes:
+  subsvc-data:
