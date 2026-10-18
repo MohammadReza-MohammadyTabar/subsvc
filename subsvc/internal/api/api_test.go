@@ -18,8 +18,10 @@ import (
 	"subsvc/internal/model"
 	"subsvc/internal/proxy"
 	"subsvc/internal/service"
+	"subsvc/internal/settings"
 	"subsvc/internal/store"
 	"subsvc/internal/subscription"
+	"subsvc/internal/tester"
 )
 
 const uid = "b831381d-6324-4d53-ad4f-8cda48b30811"
@@ -27,8 +29,10 @@ const uid = "b831381d-6324-4d53-ad4f-8cda48b30811"
 // fakeProber: hosts starting with "good" are reachable and the port is the
 // latency in ms. It records the maximum number of concurrent tests.
 type fakeProber struct {
-	mu   sync.Mutex
-	gate chan struct{}
+	mu     sync.Mutex
+	gate   chan struct{}
+	last   settings.Settings
+	speeds map[string]float64 // host -> Mbps override
 
 	cur, max atomic.Int32
 	calls    atomic.Int32
@@ -36,7 +40,16 @@ type fakeProber struct {
 
 func (p *fakeProber) setGate(g chan struct{}) { p.mu.Lock(); p.gate = g; p.mu.Unlock() }
 
-func (p *fakeProber) Test(ctx context.Context, n *proxy.Node) model.TestResult {
+func (p *fakeProber) lastSettings() settings.Settings {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.last
+}
+
+// Test fakes the real tester: hosts starting with "good" pass the general
+// probe (latency = port ms) and the speed test (1000/port Mbps unless
+// overridden); hosts containing "noyt" fail YouTube only.
+func (p *fakeProber) Test(ctx context.Context, n *proxy.Node, s settings.Settings, _ tester.Gate) model.TestResult {
 	c := p.cur.Add(1)
 	defer p.cur.Add(-1)
 	for {
@@ -48,6 +61,8 @@ func (p *fakeProber) Test(ctx context.Context, n *proxy.Node) model.TestResult {
 	p.calls.Add(1)
 	p.mu.Lock()
 	g := p.gate
+	p.last = s
+	speeds := p.speeds
 	p.mu.Unlock()
 	if g != nil {
 		select {
@@ -58,10 +73,30 @@ func (p *fakeProber) Test(ctx context.Context, n *proxy.Node) model.TestResult {
 	}
 	now := time.Now().UTC()
 	r := model.TestResult{Tested: true, TestedAt: &now}
-	if strings.HasPrefix(n.Host, "good") {
-		r.Reachable, r.StatusCode, r.LatencyMS = true, 204, int64(n.Port)
+	good := strings.HasPrefix(n.Host, "good") || strings.HasPrefix(n.Host, "noyt")
+	if good {
+		r.General = &model.Probe{Tested: true, OK: true, StatusCode: 204, LatencyMS: int64(n.Port)}
 	} else {
-		r.Error = "timeout after 5000ms"
+		r.General = &model.Probe{Tested: true, Error: "timeout after 5000ms", ErrorKind: model.ErrKindTimeout}
+	}
+	if s.YouTubeEnabled {
+		if good && !strings.HasPrefix(n.Host, "noyt") {
+			r.YouTube = &model.Probe{Tested: true, OK: true, StatusCode: 204, LatencyMS: int64(n.Port) + 10}
+		} else {
+			r.YouTube = &model.Probe{Tested: true, Error: "tunnel closed", ErrorKind: model.ErrKindConnect}
+		}
+	}
+	r.SyncLegacy()
+	if s.SpeedEnabled {
+		if !s.ProbesPass(r) {
+			r.Speed = &model.Speed{Skipped: "connectivity criteria not met"}
+		} else {
+			mbps := 1000 / float64(n.Port)
+			if v, ok := speeds[n.Host]; ok {
+				mbps = v
+			}
+			r.Speed = &model.Speed{Tested: true, OK: true, Mbps: mbps, Bytes: s.SpeedMaxBytes, DurationMS: 100}
+		}
 	}
 	return r
 }
@@ -73,6 +108,7 @@ type env struct {
 	svc   *service.Service
 	srv   *httptest.Server
 	probe *fakeProber
+	cfg   *settings.Manager
 	subs  *httptest.Server
 	subA  atomic.Value // current body of /a
 	failA atomic.Bool
@@ -80,7 +116,7 @@ type env struct {
 
 func newEnv(t *testing.T, token string) *env {
 	t.Helper()
-	e := &env{t: t, dir: t.TempDir(), probe: &fakeProber{}}
+	e := &env{t: t, dir: t.TempDir(), probe: &fakeProber{speeds: map[string]float64{}}}
 	a := base64.StdEncoding.EncodeToString([]byte(strings.Join([]string{
 		"vless://" + uid + "@good1.example.com:300?security=tls&sni=a.com#A-name",
 		"vless://" + uid + "@good2.example.com:100?security=tls&sni=a.com#two",
@@ -101,6 +137,12 @@ func newEnv(t *testing.T, token string) *env {
 		w.Write([]byte(e.subA.Load().(string)))
 	})
 	mux.HandleFunc("/b", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(b)) })
+	c := strings.Join([]string{
+		"vless://" + uid + "@noyt1.example.com:150?security=tls&sni=a.com#no-youtube",
+		"vless://" + uid + "@goodslow.example.com:400?security=tls&sni=a.com#slow-latency-fast-speed",
+		"vless://" + uid + "@goodfast.example.com:120?security=tls&sni=a.com#fast-latency-slow-speed",
+	}, "\n")
+	mux.HandleFunc("/c", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(c)) })
 	e.subs = httptest.NewServer(mux)
 	t.Cleanup(e.subs.Close)
 	e.open(token)
@@ -113,10 +155,19 @@ func (e *env) open(token string) {
 		e.t.Fatal(err)
 	}
 	e.st = st
+	lim := settings.DefaultLimits()
+	lim.AllowPrivateURLs = true // the tests' own servers are on loopback
+	mgr, err := settings.Open(e.dir, lim)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	e.cfg = mgr
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	e.svc = service.New(log, st, subscription.NewFetcher(time.Second, 1<<20, "test"), e.probe,
-		service.Options{FetchConcurrency: 2, TestConcurrency: 2})
-	e.srv = httptest.NewServer(New(e.svc, log, token))
+	newFetcher := func(s settings.Settings) service.Fetcher {
+		return subscription.NewFetcher(time.Second, 1<<20, "test")
+	}
+	e.svc = service.New(log, st, newFetcher, e.probe, mgr)
+	e.srv = httptest.NewServer(New(e.svc, log, token, mgr, map[string]any{"listen": "127.0.0.1:0", "auth": token != ""}))
 	e.t.Cleanup(e.srv.Close)
 }
 

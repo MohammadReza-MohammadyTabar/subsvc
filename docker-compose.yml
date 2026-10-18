@@ -1,24 +1,51 @@
+# Usage:
+#   cp .env.example .env     # then set SUBSVC_AUTH_TOKEN
+#   docker compose pull && docker compose up -d      (images from Docker Hub)
+#   docker compose up -d --build                     (build from this checkout)
 services:
   subsvc:
+    image: maxell11/subsvc:latest
     build: ./subsvc
     container_name: subsvc
     restart: unless-stopped
+    init: true
     ports:
-      - "8080:8080"
+      - "${SUBSVC_PORT:-8080}:8080"
+    environment:
+      # Deployment settings only. Test/speed/ranking settings live in the UI.
+      SUBSVC_LISTEN: "0.0.0.0:8080"
+      SUBSVC_DATA_DIR: /var/lib/subsvc
+      SUBSVC_AUTH_TOKEN: ${SUBSVC_AUTH_TOKEN:?set SUBSVC_AUTH_TOKEN in .env (see .env.example)}
+      SUBSVC_LOG_LEVEL: ${SUBSVC_LOG_LEVEL:-info}
+      SUBSVC_MAX_TEST_CONCURRENCY: ${SUBSVC_MAX_TEST_CONCURRENCY:-20}
     volumes:
-      - ./config.json:/etc/subsvc/config.json:ro
       - subsvc-data:/var/lib/subsvc
+    security_opt:
+      - no-new-privileges:true
+    # Sized for a 2-core / 2 GB server: ~10 parallel Xray processes fit comfortably.
+    mem_limit: 1536m
+    cpus: 2
+    pids_limit: 512
 
   subsvc-ui:
+    image: maxell11/subsvc-ui:latest
     build: ./subsvc-ui
     container_name: subsvc-ui
     restart: unless-stopped
+    init: true
     ports:
-      - "9090:9090"
+      - "${SUBSVC_UI_PORT:-9090}:9090"
     environment:
-      - SUBSC_BACKEND=http://subsvc:8080
-      - SUBSC_OUTPUT_NAME=LONG LIVE ISLAMIC REPUBLIC OF IRAN
-      - SUBSC_OUTPUT_NUMBERED=true
+      SUBSVC_UI_BACKEND: http://subsvc:8080
+      SUBSVC_UI_PORT: "9090"
+      # Used only for the public /sub endpoints; /api/* uses the token typed in the browser.
+      SUBSVC_AUTH_TOKEN: ${SUBSVC_AUTH_TOKEN:?set SUBSVC_AUTH_TOKEN in .env (see .env.example)}
+      SUBSVC_UI_OUTPUT_NAME: ${SUBSVC_UI_OUTPUT_NAME-LONG LIVE ISLAMIC REPUBLIC OF IRAN}
+      SUBSVC_UI_OUTPUT_NUMBERED: ${SUBSVC_UI_OUTPUT_NUMBERED:-true}
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 128m
+    pids_limit: 128
     depends_on:
       - subsvc
 

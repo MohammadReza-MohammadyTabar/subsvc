@@ -18,6 +18,7 @@ import (
 	"subsvc/internal/api"
 	"subsvc/internal/config"
 	"subsvc/internal/service"
+	"subsvc/internal/settings"
 	"subsvc/internal/store"
 	"subsvc/internal/subscription"
 	"subsvc/internal/tester"
@@ -26,7 +27,7 @@ import (
 var version = "dev"
 
 func main() {
-	cfgPath := flag.String("config", "", "path of the JSON config file (default "+config.DefaultPath+", built-in defaults if missing)")
+	cfgPath := flag.String("config", "", "optional legacy config file (deployment keys only; SUBSVC_* environment variables take precedence)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 	if *showVersion {
@@ -48,50 +49,59 @@ func parseLevel(s string) slog.Level {
 }
 
 func run(cfgPath string) error {
-	cfg, err := config.Load(cfgPath)
+	cfg, err := config.Load(cfgPath, os.Getenv)
 	if err != nil {
 		return err
 	}
-	// Logs go to stderr; under systemd they end up in the journal. No timestamps
-	// are needed there, but they are harmless when running in a terminal.
+	// Logs go to stderr (journal / docker logs). Secrets are never logged: only
+	// the SOURCE of the auth token is.
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: parseLevel(cfg.LogLevel)}))
+	for _, w := range cfg.Warnings {
+		log.Warn(w)
+	}
+
+	// A network-reachable API is never left open: without a token a random one
+	// is generated once and kept in <data_dir>/auth_token.
+	if err := cfg.EnsureToken(); err != nil {
+		return err
+	}
+	if cfg.TokenSource == "generated" {
+		log.Warn("no SUBSVC_AUTH_TOKEN set: generated an access token", "file", filepath.Join(cfg.DataDir, "auth_token"))
+	}
+	if cfg.AuthToken == "" {
+		log.Warn("API authentication is disabled (loopback only); set SUBSVC_AUTH_TOKEN to enable it")
+	}
 
 	st, err := store.Open(cfg.DataDir)
 	if err != nil {
 		return err
 	}
-	// Temporary per-test files live here; clear anything a crash left behind.
+	// Operational settings: stored in <data_dir>/settings.json, editable via the API/UI.
+	mgr, err := settings.Open(cfg.DataDir, cfg.Limits)
+	if err != nil {
+		return err
+	}
+	// Temporary per-test files (credentials, sockets) live here; clear anything
+	// a crash left behind.
 	workDir := filepath.Join(cfg.DataDir, "run")
 	_ = os.RemoveAll(workDir)
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
 		return fmt.Errorf("create %s: %w", workDir, err)
 	}
 
-	fetcher := subscription.NewFetcher(cfg.FetchTimeout(), cfg.MaxBodyBytes, cfg.UserAgent)
-	probe := tester.New(tester.Options{
-		CorePath:       cfg.Test.CorePath,
-		URL:            cfg.Test.URL,
-		Timeout:        cfg.TestTimeout(),
-		StartupTimeout: cfg.StartupTimeout(),
-		WorkDir:        workDir,
-	})
-	svc := service.New(log, st, fetcher, probe, service.Options{
-		FetchConcurrency: cfg.FetchConcurrency,
-		TestConcurrency:  cfg.Test.Concurrency,
-	})
-
-	if _, err := os.Stat(cfg.Test.CorePath); err != nil {
-		log.Warn("proxy core not found: tests will fail until it is installed", "path", cfg.Test.CorePath)
+	newFetcher := func(s settings.Settings) service.Fetcher {
+		return subscription.NewFetcher(time.Duration(s.FetchTimeoutSec)*time.Second, s.FetchMaxBodyBytes, s.UserAgent)
 	}
-	if cfg.AuthToken == "" {
-		if host, _, err := net.SplitHostPort(cfg.Listen); err != nil || !isLoopback(host) {
-			log.Warn("API is reachable from the network without an auth_token; set auth_token in the config")
-		}
+	probe := tester.New(tester.Options{CorePath: cfg.CorePath, WorkDir: workDir})
+	svc := service.New(log, st, newFetcher, probe, mgr)
+
+	if _, err := os.Stat(cfg.CorePath); err != nil {
+		log.Warn("proxy core not found: tests will fail until it is installed", "path", cfg.CorePath)
 	}
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           api.New(svc, log, cfg.AuthToken),
+		Handler:           api.New(svc, log, cfg.AuthToken, mgr, cfg.Summary()),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -103,8 +113,9 @@ func run(cfgPath string) error {
 	if err != nil {
 		return err
 	}
+	cur := mgr.Get()
 	log.Info("started", "version", version, "listen", ln.Addr().String(), "data_dir", cfg.DataDir,
-		"test_url", cfg.Test.URL, "test_timeout_ms", cfg.Test.TimeoutMS, "test_concurrency", cfg.Test.Concurrency)
+		"test_concurrency", cur.TestConcurrency, "youtube", cur.YouTubeEnabled, "speed", cur.SpeedEnabled)
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Serve(ln) }()
@@ -128,12 +139,4 @@ func run(cfgPath string) error {
 		log.Error("final save", "error", err)
 	}
 	return nil
-}
-
-func isLoopback(host string) bool {
-	if host == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
 }

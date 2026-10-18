@@ -11,7 +11,7 @@ Running as a Docker container — no Go, no Xray, no manual setup required.
 - Stores multiple subscription URLs
 - Fetches and parses configs (plain text or Base64)
 - Removes duplicates by normalized URI (not display name)
-- Tests each config **through its own proxy tunnel** against `https://i.ytimg.com/generate_204`
+- Tests each config **through its own proxy tunnel** against `https://www.google.com/generate_204` (general) and `https://www.youtube.com/generate_204` (YouTube), plus an optional capped speed test
 - Only configs that return `204` are kept in the output
 - Serves a Base64 subscription URL ready for any client
 - Includes a web UI for managing links, monitoring progress, and getting results
@@ -78,29 +78,44 @@ Every time you tap "Update" in the client, it fetches the latest working configs
 
 ## Configuration
 
-Edit `config.json` in this folder, then:
+There are two kinds of settings, with a clear precedence.
 
-```bash
-docker compose restart subsvc
-```
+**1. Deployment settings** — environment variables (`SUBSVC_*`), set in `.env` / `docker-compose.yml`. Changing them needs `docker compose up -d`.
+Precedence: **ENV > optional legacy `config.json` (only `listen`, `data_dir`, `auth_token`, `log_level`, `test.core_path`) > defaults**.
 
-Key options:
-
-| Key | Default | Meaning |
+| Variable | Default | Meaning |
 |---|---|---|
-| `listen` | `0.0.0.0:8080` | API bind address (don't change inside Docker) |
-| `auth_token` | `""` | If set, all API calls need `Authorization: Bearer <token>` |
-| `log_level` | `info` | `debug` / `info` / `warn` / `error` |
-| `fetch_timeout_sec` | `20` | Timeout for downloading each subscription |
-| `test.url` | `https://i.ytimg.com/generate_204` | URL used to test configs |
-| `test.timeout_ms` | `5000` | Per-config timeout in milliseconds |
-| `test.concurrency` | `10` | How many configs tested at once (raise on strong machines) |
+| `SUBSVC_AUTH_TOKEN` | *(required in compose)* | Bearer token for the whole API (`/healthz` excepted). Also `SUBSVC_AUTH_TOKEN_FILE` |
+| `SUBSVC_LISTEN` | `127.0.0.1:8080` (`0.0.0.0:8080` in Docker) | API bind address. Non-loopback without a token → a random token is generated and stored in `<data_dir>/auth_token` (0600) |
+| `SUBSVC_DATA_DIR` | `/var/lib/subsvc` (`/data` in Docker) | Links, results and `settings.json` |
+| `SUBSVC_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
+| `SUBSVC_CORE_PATH` | `/usr/local/bin/xray` | Proxy core binary |
+| `SUBSVC_MAX_TEST_CONCURRENCY` | `20` | Hard upper limit the UI cannot exceed |
+| `SUBSVC_MAX_SPEED_BYTES` | `8388608` | Hard upper limit for the speed-test size |
+| `SUBSVC_ALLOW_PRIVATE_TEST_URLS` | `false` | Allow private/loopback test URLs (local testing only) |
+| `SUBSVC_PORT` / `SUBSVC_UI_PORT` | `8080` / `9090` | Published host ports (compose) |
+| `SUBSVC_UI_OUTPUT_NAME`, `SUBSVC_UI_OUTPUT_NUMBERED` | | Naming of configs in `/sub` |
 
-After editing, restart the container:
+**2. Operational settings** — edited in the UI (**Settings** tab) or `GET/PUT /api/settings`, validated by the backend, saved in `<data_dir>/settings.json` and kept across restarts. They are *not* read from `config.json` or ENV. A running test keeps the settings it started with; changes apply to the next run.
+
+- test concurrency (default 10), general/YouTube/speed timeouts
+- general URL (`https://www.google.com/generate_204`) and YouTube URL (`https://www.youtube.com/generate_204`)
+- speed test on/off and max bytes per config (default 1 MB), speed concurrency
+- success criteria (require general / YouTube / minimum speed, max latency) and ranking (`score` / `latency` / `speed`, weights)
+
+### How testing works
+
+Every probe goes through the config's **own tunnel** (a short-lived Xray process with one outbound; direct connections are blocked). Per config, **general**, **YouTube** and **speed** are judged independently, each with its own latency and error kind (`timeout`, `dns`, `tls`, `connect`, `http_status`, ...). The speed test only runs for configs whose connectivity checks pass. A config is *eligible* for `/sub` according to the success criteria in Settings, and ranking is never by latency alone. Configs tested before this version have no YouTube verdict and need a retest if YouTube is required.
+
+### Updating Docker
 
 ```bash
-docker compose restart subsvc
+cp .env.example .env            # first time only; set SUBSVC_AUTH_TOKEN (openssl rand -hex 24)
+docker compose pull && docker compose up -d        # published images
+docker compose up -d --build                       # or build from this source
 ```
+
+Existing volumes keep working (ownership is fixed once by the entrypoint).
 
 ---
 
@@ -110,7 +125,7 @@ docker compose restart subsvc
 docker compose ps                  # status
 docker compose logs -f subsvc      # live logs
 docker compose logs -f subsvc-ui
-docker compose restart subsvc      # apply config changes
+docker compose up -d               # apply .env changes
 docker compose down                # stop everything
 docker compose up -d               # start again
 docker compose pull && docker compose up -d   # update images
@@ -140,11 +155,10 @@ docker run --rm -v downloads_subsvc-data:/data -v ${PWD}:/backup alpine \
 
 ## Security notes
 
-- By default `auth_token` is **empty**, meaning anyone who can reach port 8080 can control the service. If you expose it to a network you don't trust, **set a token**.
-- Port 9090 (UI) has no built-in auth. It proxies requests to the backend using the token from the server side, so v2rayNG can fetch `/sub` without credentials. **Don't expose port 9090 to the internet.**
-- The service is designed to run on localhost or behind a VPN / SSH tunnel.
-
----
+- The API requires `Authorization: Bearer <token>` (except `/healthz`); docker-compose refuses to start without `SUBSVC_AUTH_TOKEN`. Tokens are never logged.
+- The UI (port 9090) does **not** add the server token to `/api/*`; paste the token into the UI once (kept in your browser). Only `/sub` is public, so v2rayNG can fetch it. Still, don't expose 9090 to the internet unless you accept a public `/sub`.
+- Settings changes need the token; test URLs are validated (http/https, no credentials, no loopback/private addresses).
+- Resources: bounded concurrency, one short-lived core per test with capped memory/CPU, cancellable runs, cleanup of temp dirs; compose sets CPU/memory limits.
 
 ## Troubleshooting
 
@@ -153,7 +167,7 @@ docker run --rm -v downloads_subsvc-data:/data -v ${PWD}:/backup alpine \
 | UI shows "خطای اتصال" | `docker compose ps` — check `subsvc` container is Up |
 | All tests show `timeout` | From inside the container, check: `docker exec subsvc wget -qO- https://www.google.com/generate_204` |
 | `Address already in use` on port 8080 or 9090 | Another program uses the port. Change it in `docker-compose.yml` |
-| Config changes don't apply | You forgot `docker compose restart subsvc` |
+| ENV changes don't apply | Run `docker compose up -d` (settings made in the UI apply immediately) |
 | v2rayNG can't fetch `/sub` | Open http://localhost:9090 in a browser and check the Subscription tab shows a working URL |
 
 ---
@@ -163,7 +177,7 @@ docker run --rm -v downloads_subsvc-data:/data -v ${PWD}:/backup alpine \
 ```
 .
 ├── docker-compose.yml
-├── config.json              ← edit this
+├── .env.example             ← copy to .env, set SUBSVC_AUTH_TOKEN
 ├── README.md
 ├── subsvc/                  ← Go backend source
 └── subsvc-ui/               ← Python UI + HTML
@@ -259,28 +273,39 @@ http://<IP-کامپیوتر-تو>:9090/sub
 
 ## پیکربندی
 
-فایل `config.json` در همین پوشه را ویرایش کن، بعد:
+دو دسته تنظیمات داریم و اولویت‌ها مشخص است.
 
-```bash
-docker compose restart subsvc
-```
+**۱. تنظیمات استقرار** — متغیرهای محیطی `SUBSVC_*` در `.env` یا `docker-compose.yml`؛ تغییر با `docker compose up -d` اعمال می‌شود.
+اولویت: **ENV ‏>‏ فایل قدیمی `config.json` (فقط `listen`، `data_dir`، `auth_token`، `log_level`، `test.core_path`) ‏>‏ پیش‌فرض**.
 
-گزینه‌های مهم:
-
-| کلید | پیش‌فرض | معنی |
+| متغیر | پیش‌فرض | معنی |
 |---|---|---|
-| `listen` | `0.0.0.0:8080` | آدرس bind (داخل Docker دست نزن) |
-| `auth_token` | `""` | اگه پر باشه، همه‌ی درخواست‌ها به `Authorization: Bearer <token>` نیاز دارن |
-| `log_level` | `info` | `debug` / `info` / `warn` / `error` |
-| `fetch_timeout_sec` | `20` | Timeout دانلود هر اشتراک |
-| `test.url` | `https://i.ytimg.com/generate_204` | URL تست کانفیگ‌ها |
-| `test.timeout_ms` | `5000` | Timeout هر کانفیگ به میلی‌ثانیه |
-| `test.concurrency` | `10` | چند کانفیگ هم‌زمان تست بشن (روی سیستم قوی بالاتر ببر) |
+| `SUBSVC_AUTH_TOKEN` | *(در compose الزامی)* | توکن Bearer برای کل API (به‌جز `/healthz`) |
+| `SUBSVC_LISTEN` | `127.0.0.1:8080` (در Docker ‏`0.0.0.0:8080`) | آدرس bind. اگر loopback نباشد و توکن نباشد، توکن تصادفی ساخته و در `<data_dir>/auth_token` ذخیره می‌شود |
+| `SUBSVC_DATA_DIR` | `/var/lib/subsvc` (در Docker ‏`/data`) | لینک‌ها، نتایج و `settings.json` |
+| `SUBSVC_LOG_LEVEL` | `info` | سطح لاگ |
+| `SUBSVC_CORE_PATH` | `/usr/local/bin/xray` | مسیر هسته |
+| `SUBSVC_MAX_TEST_CONCURRENCY` | `20` | سقف سخت هم‌زمانی که UI نمی‌تواند از آن بیشتر کند |
+| `SUBSVC_MAX_SPEED_BYTES` | `8388608` | سقف سخت حجم تست سرعت |
+| `SUBSVC_PORT` / `SUBSVC_UI_PORT` | `8080` / `9090` | پورت‌های منتشرشده روی میزبان |
 
-بعد از ویرایش، کانتینر را ری‌استارت کن:
+**۲. تنظیمات عملیاتی** — از تب **تنظیمات** در UI (یا `GET/PUT /api/settings`) ویرایش می‌شوند، در بک‌اند اعتبارسنجی و در `<data_dir>/settings.json` ذخیره می‌شوند و بعد از ری‌استارت می‌مانند. از `config.json` یا ENV خوانده نمی‌شوند. تست در حال اجرا با تنظیمات زمان شروعش ادامه می‌دهد و تغییر روی اجرای بعدی اثر دارد.
+
+- هم‌زمانی تست (پیش‌فرض ۱۰) و timeout های عمومی/یوتیوب/سرعت
+- آدرس تست عمومی (`https://www.google.com/generate_204`) و یوتیوب (`https://www.youtube.com/generate_204`)
+- روشن/خاموش بودن تست سرعت و حداکثر حجم هر کانفیگ (پیش‌فرض ۱ مگابایت)
+- معیار موفقیت (الزام عمومی / یوتیوب / حداقل سرعت / حداکثر تأخیر) و رتبه‌بندی (`score` / `latency` / `speed`)
+
+### نحوه‌ی تست
+
+هر تست از **تونل خود کانفیگ** عبور می‌کند (یک پروسه‌ی کوتاه‌عمر Xray؛ اتصال مستقیم مسدود است). وضعیت **عمومی**، **یوتیوب** و **سرعت** مستقل از هم و هرکدام با تأخیر و نوع خطای خودشان (`timeout`، `dns`، `tls`، `connect`، `http_status` ...) ثبت می‌شوند. تست سرعت فقط برای کانفیگ‌هایی اجرا می‌شود که تست‌های اتصال را رد کرده‌اند. رتبه‌بندی فقط بر اساس تأخیر نیست. نتایج قدیمی وضعیت یوتیوب ندارند و در صورت الزام یوتیوب باید دوباره تست شوند.
+
+### به‌روزرسانی Docker
 
 ```bash
-docker compose restart subsvc
+cp .env.example .env            # فقط بار اول؛ SUBSVC_AUTH_TOKEN را تنظیم کن (openssl rand -hex 24)
+docker compose pull && docker compose up -d        # ایمیج‌های منتشرشده
+docker compose up -d --build                       # یا ساخت از سورس
 ```
 
 ---
@@ -321,11 +346,10 @@ docker run --rm -v downloads_subsvc-data:/data -v ${PWD}:/backup alpine \
 
 ## نکات امنیتی
 
-- به‌صورت پیش‌فرض `auth_token` **خالی** است، یعنی هر کسی که به پورت 8080 دسترسی دارد می‌تواند سرویس را کنترل کند. اگر آن را روی شبکه‌ای که به آن اعتماد نداری باز می‌کنی، **حتماً توکن بگذار**.
-- پورت 9090 (UI) احراز هویت ندارد. درخواست‌ها را با توکن سمت سرور به backend پروکسی می‌کند تا v2rayNG بتواند بدون credential از `/sub` استفاده کند. **پورت 9090 را روی اینترنت باز نکن.**
-- این سرویس برای اجرا روی localhost یا پشت VPN / SSH tunnel طراحی شده.
-
----
+- API به `Authorization: Bearer <token>` نیاز دارد (به‌جز `/healthz`)؛ compose بدون `SUBSVC_AUTH_TOKEN` بالا نمی‌آید. توکن هرگز لاگ نمی‌شود.
+- UI توکن سرور را به `/api/*` اضافه نمی‌کند؛ توکن را یک‌بار در UI وارد کن (در مرورگر می‌ماند). فقط `/sub` عمومی است تا v2rayNG بتواند بگیرد.
+- تغییر تنظیمات نیاز به توکن دارد؛ آدرس‌های تست اعتبارسنجی می‌شوند (بدون credential و آدرس خصوصی/loopback).
+- منابع: هم‌زمانی محدود، یک هسته‌ی کوتاه‌عمر برای هر تست با سقف حافظه/CPU، لغو و پاک‌سازی کامل؛ compose محدودیت CPU/RAM دارد.
 
 ## عیب‌یابی
 
@@ -344,7 +368,7 @@ docker run --rm -v downloads_subsvc-data:/data -v ${PWD}:/backup alpine \
 ```
 .
 ├── docker-compose.yml
-├── config.json              ← این را ویرایش کن
+├── .env.example             ← کپی به .env و تنظیم SUBSVC_AUTH_TOKEN
 ├── README.md
 ├── subsvc/                  ← سورس Go backend
 └── subsvc-ui/               ← Python UI + HTML

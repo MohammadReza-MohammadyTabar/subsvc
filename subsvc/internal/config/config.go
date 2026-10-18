@@ -1,141 +1,278 @@
-// Package config loads and validates the service configuration file.
+// Package config reads the DEPLOYMENT settings of the service: listen address,
+// data directory, auth token, log level, core path and hard limits.
+//
+// Precedence, highest first:
+//
+//  1. environment variables with the SUBSVC_ prefix
+//  2. the optional legacy config file (-config / SUBSVC_CONFIG); only the
+//     deployment keys listen, data_dir, auth_token, log_level and
+//     test.core_path are read from it (kept so existing installs keep working)
+//  3. built-in defaults
+//
+// Operational settings (timeouts, test URLs, concurrency, speed test, success
+// criteria, ranking, ...) are NOT read here. They live in internal/settings,
+// are edited through the API/UI and stored in <data_dir>/settings.json.
 package config
 
 import (
-	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
-	"net/url"
+	"net"
 	"os"
-	"time"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+
+	"subsvc/internal/settings"
 )
 
-// DefaultPath is used when no -config flag is given.
-const DefaultPath = "/etc/subsvc/config.json"
+// LegacyPath is tried when no config file is given.
+const LegacyPath = "/etc/subsvc/config.json"
 
-// MaxTestConcurrency is a hard ceiling to keep CPU/RAM low on small servers.
-const MaxTestConcurrency = 200
-
-// Test holds the settings of the real connectivity test.
-type Test struct {
-	URL              string `json:"url"`
-	TimeoutMS        int    `json:"timeout_ms"`         // per-config probe timeout
-	StartupTimeoutMS int    `json:"startup_timeout_ms"` // time allowed for the core to start listening
-	Concurrency      int    `json:"concurrency"`        // 1..2
-	CorePath         string `json:"core_path"`          // path of the xray binary
-}
-
-// Config is the whole configuration file.
+// Config holds the deployment settings.
 type Config struct {
-	Listen           string `json:"listen"`
-	DataDir          string `json:"data_dir"`
-	AuthToken        string `json:"auth_token"` // empty = no authentication
-	LogLevel         string `json:"log_level"`  // debug|info|warn|error
-	FetchTimeoutSec  int    `json:"fetch_timeout_sec"`
-	FetchConcurrency int    `json:"fetch_concurrency"`
-	MaxBodyBytes     int64  `json:"max_body_bytes"`
-	UserAgent        string `json:"user_agent"`
-	Test             Test   `json:"test"`
+	Listen    string
+	DataDir   string
+	AuthToken string
+	LogLevel  string
+	CorePath  string
+	Limits    settings.Limits
+
+	// TokenSource says where AuthToken came from: env, env-file, legacy-file,
+	// generated, stored or none. Never contains the token itself.
+	TokenSource string
+	// Warnings are notes for the log (ignored legacy keys, ...).
+	Warnings []string
 }
 
-// Default returns the built-in defaults.
-func Default() Config {
+// Defaults returns the built-in deployment defaults.
+func Defaults() Config {
 	return Config{
-		Listen:           "127.0.0.1:8080",
-		DataDir:          "/var/lib/subsvc",
-		LogLevel:         "info",
-		FetchTimeoutSec:  20,
-		FetchConcurrency: 2,
-		MaxBodyBytes:     10 << 20,
-		UserAgent:        "subsvc/1.0",
-		Test: Test{
-			URL:              "https://www.google.com/generate_204",
-			TimeoutMS:        5000,
-			StartupTimeoutMS: 4000,
-			Concurrency:      2,
-			CorePath:         "/usr/local/bin/xray",
-		},
+		Listen:   "127.0.0.1:8080",
+		DataDir:  "/var/lib/subsvc",
+		LogLevel: "info",
+		CorePath: "/usr/local/bin/xray",
+		Limits:   settings.DefaultLimits(),
 	}
 }
 
-// Load reads path. If path is empty it tries DefaultPath and silently falls back
-// to the defaults when that file does not exist. An explicit path must exist.
-func Load(path string) (*Config, error) {
-	cfg := Default()
-	explicit := path != ""
+// Load applies defaults, then the legacy file, then the environment.
+// legacyPath may be empty. getenv is os.Getenv in production.
+func Load(legacyPath string, getenv func(string) string) (*Config, error) {
+	c := Defaults()
+
+	explicit := legacyPath != ""
 	if !explicit {
-		path = DefaultPath
+		legacyPath = getenv("SUBSVC_CONFIG")
+		explicit = legacyPath != ""
 	}
+	if !explicit {
+		legacyPath = LegacyPath
+	}
+	if err := c.applyLegacyFile(legacyPath, explicit); err != nil {
+		return nil, err
+	}
+	if err := c.applyEnv(getenv); err != nil {
+		return nil, err
+	}
+	return &c, c.validate()
+}
+
+// legacyOperational lists keys of the old config.json that are now managed in
+// the UI/API; they are ignored (with a warning) rather than treated as errors.
+var legacyOperational = map[string]bool{
+	"fetch_timeout_sec": true, "fetch_concurrency": true, "max_body_bytes": true, "user_agent": true, "test": true,
+}
+
+func (c *Config) applyLegacyFile(path string, mustExist bool) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		if !explicit && errors.Is(err, fs.ErrNotExist) {
-			return &cfg, cfg.Validate()
+		if !mustExist && (errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrPermission)) {
+			return nil // optional file: absent (or unreadable by this user) is fine
 		}
-		return nil, fmt.Errorf("read config: %w", err)
+		return fmt.Errorf("read config file: %w", err)
 	}
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields() // catch typos in key names
-	if err := dec.Decode(&cfg); err != nil {
-		return nil, fmt.Errorf("parse config %s: %w", path, err)
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("parse config file %s: %w", path, err)
 	}
-	if err := cfg.Validate(); err != nil {
-		return nil, fmt.Errorf("config %s: %w", path, err)
+	str := func(key string, dst *string) error {
+		v, ok := raw[key]
+		if !ok {
+			return nil
+		}
+		var s string
+		if err := json.Unmarshal(v, &s); err != nil {
+			return fmt.Errorf("config file %s: %s must be a string", path, key)
+		}
+		if s != "" {
+			*dst = s
+		}
+		return nil
 	}
-	return &cfg, nil
-}
-
-// Validate checks the values.
-func (c *Config) Validate() error {
-	if c.Listen == "" {
-		return errors.New("listen must not be empty")
+	for key, dst := range map[string]*string{"listen": &c.Listen, "data_dir": &c.DataDir, "log_level": &c.LogLevel} {
+		if err := str(key, dst); err != nil {
+			return err
+		}
 	}
-	if c.DataDir == "" {
-		return errors.New("data_dir must not be empty")
+	if err := str("auth_token", &c.AuthToken); err != nil {
+		return err
 	}
-	switch c.LogLevel {
-	case "debug", "info", "warn", "error":
-	default:
-		return fmt.Errorf("log_level %q must be debug, info, warn or error", c.LogLevel)
+	if c.AuthToken != "" {
+		c.TokenSource = "legacy-file"
 	}
-	if c.FetchTimeoutSec < 1 || c.FetchTimeoutSec > 300 {
-		return errors.New("fetch_timeout_sec must be between 1 and 300")
+	if t, ok := raw["test"]; ok {
+		var test struct {
+			CorePath string `json:"core_path"`
+		}
+		if err := json.Unmarshal(t, &test); err == nil && test.CorePath != "" {
+			c.CorePath = test.CorePath
+		}
 	}
-	if c.FetchConcurrency < 1 || c.FetchConcurrency > 4 {
-		return errors.New("fetch_concurrency must be between 1 and 4")
+	var ignored []string
+	for k := range raw {
+		if legacyOperational[k] {
+			ignored = append(ignored, k)
+		}
 	}
-	if c.MaxBodyBytes < 1024 {
-		return errors.New("max_body_bytes must be at least 1024")
-	}
-	u, err := url.Parse(c.Test.URL)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return fmt.Errorf("test.url %q is not a valid http(s) URL", c.Test.URL)
-	}
-	if c.Test.TimeoutMS < 100 || c.Test.TimeoutMS > 120000 {
-		return errors.New("test.timeout_ms must be between 100 and 120000")
-	}
-	if c.Test.StartupTimeoutMS < 500 || c.Test.StartupTimeoutMS > 60000 {
-		return errors.New("test.startup_timeout_ms must be between 500 and 60000")
-	}
-	if c.Test.Concurrency < 1 || c.Test.Concurrency > MaxTestConcurrency {
-		return fmt.Errorf("test.concurrency must be 1 or %d", MaxTestConcurrency)
-	}
-	if c.Test.CorePath == "" {
-		return errors.New("test.core_path must not be empty")
+	if len(ignored) > 0 {
+		sort.Strings(ignored)
+		c.Warnings = append(c.Warnings, fmt.Sprintf(
+			"config file %s: operational keys [%s] are ignored; they are managed in the UI/API (settings.json)",
+			path, strings.Join(ignored, ", ")))
 	}
 	return nil
 }
 
-// FetchTimeout returns the subscription download timeout.
-func (c *Config) FetchTimeout() time.Duration { return time.Duration(c.FetchTimeoutSec) * time.Second }
+func (c *Config) applyEnv(getenv func(string) string) error {
+	set := func(name string, dst *string) {
+		if v := strings.TrimSpace(getenv(name)); v != "" {
+			*dst = v
+		}
+	}
+	set("SUBSVC_LISTEN", &c.Listen)
+	set("SUBSVC_DATA_DIR", &c.DataDir)
+	set("SUBSVC_LOG_LEVEL", &c.LogLevel)
+	set("SUBSVC_CORE_PATH", &c.CorePath)
 
-// TestTimeout returns the per-config probe timeout.
-func (c *Config) TestTimeout() time.Duration {
-	return time.Duration(c.Test.TimeoutMS) * time.Millisecond
+	if v := strings.TrimSpace(getenv("SUBSVC_AUTH_TOKEN")); v != "" {
+		c.AuthToken, c.TokenSource = v, "env"
+	} else if f := strings.TrimSpace(getenv("SUBSVC_AUTH_TOKEN_FILE")); f != "" {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			return fmt.Errorf("SUBSVC_AUTH_TOKEN_FILE: %w", err)
+		}
+		if t := strings.TrimSpace(string(b)); t != "" {
+			c.AuthToken, c.TokenSource = t, "env-file"
+		}
+	}
+
+	if v := strings.TrimSpace(getenv("SUBSVC_MAX_TEST_CONCURRENCY")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 64 {
+			return errors.New("SUBSVC_MAX_TEST_CONCURRENCY must be an integer between 1 and 64")
+		}
+		c.Limits.MaxTestConcurrency = n
+	}
+	if v := strings.TrimSpace(getenv("SUBSVC_MAX_SPEED_BYTES")); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 64<<10 || n > 64<<20 {
+			return errors.New("SUBSVC_MAX_SPEED_BYTES must be an integer between 65536 and 67108864")
+		}
+		c.Limits.MaxSpeedBytes = n
+	}
+	if v := strings.TrimSpace(getenv("SUBSVC_ALLOW_PRIVATE_TEST_URLS")); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return errors.New("SUBSVC_ALLOW_PRIVATE_TEST_URLS must be true or false")
+		}
+		c.Limits.AllowPrivateURLs = b
+	}
+	return nil
 }
 
-// StartupTimeout returns the time the core may take to start listening.
-func (c *Config) StartupTimeout() time.Duration {
-	return time.Duration(c.Test.StartupTimeoutMS) * time.Millisecond
+func (c *Config) validate() error {
+	if _, _, err := net.SplitHostPort(c.Listen); err != nil {
+		return fmt.Errorf("SUBSVC_LISTEN %q must look like host:port (for example 0.0.0.0:8080): %w", c.Listen, err)
+	}
+	if !filepath.IsAbs(c.DataDir) {
+		return fmt.Errorf("SUBSVC_DATA_DIR %q must be an absolute path", c.DataDir)
+	}
+	switch c.LogLevel {
+	case "debug", "info", "warn", "error":
+	default:
+		return fmt.Errorf("SUBSVC_LOG_LEVEL %q must be debug, info, warn or error", c.LogLevel)
+	}
+	if c.CorePath == "" {
+		return errors.New("SUBSVC_CORE_PATH must not be empty")
+	}
+	if c.AuthToken != "" && len(c.AuthToken) < 8 {
+		return errors.New("the auth token must be at least 8 characters")
+	}
+	return nil
+}
+
+// IsLoopback reports whether Listen only accepts local connections.
+func (c *Config) IsLoopback() bool {
+	host, _, err := net.SplitHostPort(c.Listen)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// EnsureToken makes sure a network-reachable API is never open: when no token
+// is configured and the service does not listen on loopback only, a random
+// token is generated once and stored (0600) in <data_dir>/auth_token, and
+// reused on the next start. Its value is never logged; the file is the source.
+// Listening on loopback without a token is allowed (local use).
+func (c *Config) EnsureToken() error {
+	if c.AuthToken != "" || c.IsLoopback() {
+		return nil
+	}
+	path := filepath.Join(c.DataDir, "auth_token")
+	if b, err := os.ReadFile(path); err == nil {
+		if t := strings.TrimSpace(string(b)); len(t) >= 8 {
+			c.AuthToken, c.TokenSource = t, "stored"
+			return nil
+		}
+	}
+	if err := os.MkdirAll(c.DataDir, 0o750); err != nil {
+		return fmt.Errorf("create data dir: %w", err)
+	}
+	buf := make([]byte, 24)
+	if _, err := rand.Read(buf); err != nil {
+		return err
+	}
+	tok := hex.EncodeToString(buf)
+	if err := os.WriteFile(path, []byte(tok+"\n"), 0o600); err != nil {
+		return fmt.Errorf("store generated auth token: %w", err)
+	}
+	c.AuthToken, c.TokenSource = tok, "generated"
+	return nil
+}
+
+// Summary returns the non-secret deployment values, for the read-only part of
+// the settings API/UI.
+func (c *Config) Summary() map[string]any {
+	return map[string]any{
+		"listen":                 c.Listen,
+		"data_dir":               c.DataDir,
+		"log_level":              c.LogLevel,
+		"core_path":              c.CorePath,
+		"auth":                   c.AuthToken != "",
+		"auth_token_source":      c.TokenSource,
+		"max_test_concurrency":   c.Limits.MaxTestConcurrency,
+		"max_speed_bytes":        c.Limits.MaxSpeedBytes,
+		"allow_private_test_url": c.Limits.AllowPrivateURLs,
+	}
 }

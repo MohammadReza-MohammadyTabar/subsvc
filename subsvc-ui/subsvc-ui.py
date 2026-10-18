@@ -2,25 +2,32 @@
 import http.server, socketserver, urllib.request, urllib.error, os, json, re
 import urllib.parse
 
-BACKEND = os.environ.get("SUBSC_BACKEND", "http://127.0.0.1:8080")
-OUTPUT_NAME = os.environ.get("SUBSC_OUTPUT_NAME", "").strip()
-OUTPUT_NUMBERED = os.environ.get("SUBSC_OUTPUT_NUMBERED", "true").lower() in ("1","true","yes")
-PORT = 9090
+def env(name, legacy=None, default=""):
+    """SUBSVC_UI_* first, then the legacy SUBSC_* name, then the default."""
+    for n in (name, legacy):
+        if n and os.environ.get(n, "").strip():
+            return os.environ[n].strip()
+    return default
+
+BACKEND = env("SUBSVC_UI_BACKEND", "SUBSC_BACKEND", "http://127.0.0.1:8080")
+OUTPUT_NAME = env("SUBSVC_UI_OUTPUT_NAME", "SUBSC_OUTPUT_NAME")
+OUTPUT_NUMBERED = env("SUBSVC_UI_OUTPUT_NUMBERED", "SUBSC_OUTPUT_NUMBERED", "true").lower() in ("1", "true", "yes")
+PORT = int(env("SUBSVC_UI_PORT", None, "9090"))
 STATIC = os.path.dirname(os.path.abspath(__file__))
 
-def load_token():
-    t = os.environ.get("SUBSC_TOKEN", "").strip()
-    if t: return t
-    for path in ("/etc/subsvc/config.json", os.path.expanduser("~/.subsvc.json")):
-        try:
-            with open(path) as f:
-                t = (json.load(f).get("auth_token") or "").strip()
-                if t: return t
-        except Exception:
-            pass
-    return ""
+# Token used ONLY for the public /sub endpoints (subscription clients cannot
+# send headers). Every /api/* request uses the token the browser sends, so the
+# UI port never grants API access by itself. The token comes from the same
+# variable the backend uses; there is no config.json involved.
+TOKEN = env("SUBSVC_AUTH_TOKEN", "SUBSC_TOKEN")
 
-TOKEN = load_token()
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Cache-Control": "no-store",
+    "Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'",
+}
 
 class H(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *a, **kw):
@@ -43,6 +50,12 @@ class H(http.server.SimpleHTTPRequestHandler):
         except Exception as e:
             return 502, {"Content-Type": "application/json"}, json.dumps({"error": f"proxy: {e}"}).encode()
 
+    def _browser_token(self):
+        """The token the BROWSER sent. Never falls back to the server's own
+        token: the UI port must not grant API access to anonymous callers."""
+        auth = self.headers.get("Authorization", "")
+        return auth[7:].strip() if auth.startswith("Bearer ") else ""
+
     def _send(self, status, headers, body, ctype=None):
         self.send_response(status)
         for k, v in headers.items():
@@ -52,7 +65,8 @@ class H(http.server.SimpleHTTPRequestHandler):
         if ctype:
             self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        for k, v in SECURITY_HEADERS.items():
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
@@ -74,22 +88,17 @@ class H(http.server.SimpleHTTPRequestHandler):
             s, h, b = self._backend("GET", f"/api/output?format=base64&link={m.group(1)}")
             return self._send(s, h, b, "text/plain; charset=utf-8")
         if self.path.startswith("/api/") or self.path == "/healthz":
-            tok = None
-            auth = self.headers.get("Authorization", "")
-            if auth.startswith("Bearer "): tok = auth[7:]
-            s, h, b = self._backend("GET", self.path, token=tok)
+            s, h, b = self._backend("GET", self.path, token=self._browser_token())
             return self._send(s, h, b)
-        if self.path in ("/", ""):
-            self.path = "/subsvc-ui.html"
-        return super().do_GET()
+        if self.path in ("/", "", "/subsvc-ui.html"):
+            with open(os.path.join(STATIC, "subsvc-ui.html"), "rb") as f:
+                return self._send(200, {}, f.read(), "text/html; charset=utf-8")
+        return self._send(404, {}, b"not found", "text/plain; charset=utf-8")
 
     def _proxy(self, method):
         n = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(n) if n else None
-        tok = None
-        auth = self.headers.get("Authorization", "")
-        if auth.startswith("Bearer "): tok = auth[7:]
-        s, h, b = self._backend(method, self.path, body, token=tok)
+        s, h, b = self._backend(method, self.path, body, token=self._browser_token())
         return self._send(s, h, b)
 
     def do_POST(self):   self._proxy("POST")
@@ -106,5 +115,5 @@ with Server(("0.0.0.0", PORT), H) as s:
     print(f"UI: http://0.0.0.0:{PORT}")
     print(f"Subscription: http://0.0.0.0:{PORT}/sub")
     if not TOKEN:
-        print("WARN: auth token پیدا نشد — /sub کار نمی‌کنه اگه subsvc توکن داشته باشه")
+        print("WARN: SUBSVC_AUTH_TOKEN is not set for the UI container: /sub will fail if the backend requires a token")
     s.serve_forever()

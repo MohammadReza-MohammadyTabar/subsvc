@@ -17,6 +17,7 @@ import (
 
 	"subsvc/internal/model"
 	"subsvc/internal/proxy"
+	"subsvc/internal/settings"
 )
 
 var (
@@ -65,6 +66,7 @@ func Open(dir string) (*Store, error) {
 	}
 	for i := range cf.Configs {
 		e := cf.Configs[i]
+		e.Test.Normalize() // results stored by older versions have no General probe
 		s.entries[e.Key] = &e
 	}
 	return s, nil
@@ -425,21 +427,33 @@ func (s *Store) EntriesForLinks(ids []string) []model.Entry {
 	return out
 }
 
-// Reachable returns the entries whose last test succeeded, fastest first.
-func (s *Store) Reachable(linkID string) []model.Entry {
+// Views returns every entry with its derived eligibility and score, sorted by
+// key. linkID limits the result to one link.
+func (s *Store) Views(linkID string, set settings.Settings) []settings.EntryView {
 	all := s.Entries(linkID)
-	out := all[:0]
-	for _, e := range all {
-		if e.Test.Tested && e.Test.Reachable {
-			out = append(out, e)
-		}
+	out := make([]settings.EntryView, len(all))
+	for i, e := range all {
+		out[i] = set.View(e)
 	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].Test.LatencyMS < out[j].Test.LatencyMS })
 	return out
 }
 
-// Stats returns summary counters.
-func (s *Store) Stats() model.Stats {
+// Selected returns the entries that meet the success criteria (the content of
+// the output), best first according to the ranking settings.
+func (s *Store) Selected(linkID string, set settings.Settings) []settings.EntryView {
+	views := s.Views(linkID, set)
+	out := views[:0]
+	for _, v := range views {
+		if v.Eligible {
+			out = append(out, v)
+		}
+	}
+	set.Rank(out)
+	return out
+}
+
+// Stats returns summary counters. Eligible depends on the success criteria.
+func (s *Store) Stats(set settings.Settings) model.Stats {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	st := model.Stats{Links: len(s.links), Configs: len(s.entries)}
@@ -447,11 +461,21 @@ func (s *Store) Stats() model.Stats {
 		if e.Unsupported != "" {
 			st.Unsupported++
 		}
-		if e.Test.Tested {
-			st.Tested++
-			if e.Test.Reachable {
-				st.Reachable++
-			}
+		if !e.Test.Tested {
+			continue
+		}
+		st.Tested++
+		if g := e.Test.General; g != nil && g.OK {
+			st.Reachable++
+		}
+		if y := e.Test.YouTube; y != nil && y.OK {
+			st.YouTubeOK++
+		}
+		if sp := e.Test.Speed; sp != nil && sp.Tested {
+			st.SpeedTested++
+		}
+		if set.Eligible(e.Test) {
+			st.Eligible++
 		}
 	}
 	return st
@@ -488,12 +512,12 @@ func (s *Store) DeleteEntry(key string) error {
 // A config is deleted only when it no longer belongs to any link.
 //
 // Supported filters:
-//   - "failed":      tested == true && reachable == false
-//   - "untested":    tested == false && supported (Unsupported == "")
+//   - "failed":      tested but not meeting the success criteria
+//   - "untested":    not tested yet and supported (Unsupported == "")
 //   - "unsupported": Unsupported != ""
-//   - "unreachable": reachable == false (covers failed + untested + unsupported)
-func (s *Store) DeleteEntries(filter, linkID string) (int, error) {
-  switch filter {
+//   - "unreachable": not meeting the success criteria (failed + untested + unsupported)
+func (s *Store) DeleteEntries(filter, linkID string, set settings.Settings) (int, error) {
+	switch filter {
 	case "failed", "untested", "unsupported", "unreachable", "all":
 	default:
 		return 0, fmt.Errorf("unknown filter %q (want failed|untested|unsupported|unreachable|all)", filter)
@@ -508,7 +532,7 @@ func (s *Store) DeleteEntries(filter, linkID string) (int, error) {
 		if linkID != "" && !contains(e.Sources, linkID) {
 			continue
 		}
-		if !matchDeleteFilter(e, filter) {
+		if !matchDeleteFilter(e, filter, set) {
 			continue
 		}
 		changed = true
@@ -531,16 +555,19 @@ func (s *Store) DeleteEntries(filter, linkID string) (int, error) {
 	return removed, nil
 }
 
-func matchDeleteFilter(e *model.Entry, filter string) bool {
+// matchDeleteFilter: "failed" = tested but not meeting the success criteria;
+// "unreachable" = everything that is not in the output (failed + untested +
+// unsupported).
+func matchDeleteFilter(e *model.Entry, filter string, set settings.Settings) bool {
 	switch filter {
 	case "failed":
-		return e.Test.Tested && !e.Test.Reachable
+		return e.Test.Tested && !set.Eligible(e.Test)
 	case "untested":
 		return !e.Test.Tested && e.Unsupported == ""
 	case "unsupported":
 		return e.Unsupported != ""
 	case "unreachable":
-		return !e.Test.Reachable
+		return !set.Eligible(e.Test)
 	case "all":
 		return true
 	}

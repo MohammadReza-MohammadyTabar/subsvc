@@ -143,6 +143,22 @@ details[open] summary { margin-bottom: 10px; }
   background: rgba(248,81,73,.06); margin-bottom: 12px;
 }
 .danger-zone h3 { margin: 0 0 8px; font-size: 14px; color: var(--red); }
+.settings-section { margin-bottom: 20px; }
+.settings-section h3 { margin: 0 0 10px; font-size: 14px; color: var(--accent); }
+.settings-grid { display: grid; gap: 12px 16px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+.field label.lbl { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+.field input[type=text], .field input[type=number], .field select { width: 100%; }
+.field input[type=number], .field input.ltr { direction: ltr; text-align: left; }
+.field .hint { font-size: 11px; color: var(--muted); margin-top: 3px; }
+.field .chk { display: flex; gap: 8px; align-items: center; cursor: pointer; font-size: 13px; }
+.field.invalid input, .field.invalid select { border-color: var(--red); }
+.field .err { color: var(--red); font-size: 11px; margin-top: 3px; }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; font-size: 13px; }
+.kv .k { color: var(--muted); } .kv .v { direction: ltr; text-align: left; font-family: 'SF Mono', Consolas, monospace; font-size: 12px; }
+.cell { line-height: 1.35; white-space: nowrap; }
+.cell small { display: block; }
+.errs small { display: block; direction: ltr; text-align: left; color: var(--red); max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sticky-bar { position: sticky; bottom: 0; background: var(--card); padding: 10px 0; border-top: 1px solid var(--border); margin-top: 10px; }
 </style>
 </head>
 <body>
@@ -164,7 +180,7 @@ details[open] summary { margin-bottom: 10px; }
     <button onclick="saveToken()">💾 ذخیره</button>
     <button class="sec" onclick="testHealth()">🧪 تست</button>
   </div>
-  <small>از <code>/etc/subsvc/config.json</code> → کلید <code>auth_token</code></small>
+  <small>مقدار متغیر <code>SUBSVC_AUTH_TOKEN</code> سرور. اگر تنظیم نکرده باشید، سرویس خودش یک توکن می‌سازد و در <code>&lt;data_dir&gt;/auth_token</code> ذخیره می‌کند.</small>
 </section>
 
 <!-- TABS -->
@@ -174,6 +190,7 @@ details[open] summary { margin-bottom: 10px; }
   <button class="tab" data-tab="configs" onclick="showTab('configs')">🧪 کانفیگ‌ها</button>
   <button class="tab" data-tab="output" onclick="showTab('output')">📤 خروجی</button>
   <button class="tab" data-tab="sub" onclick="showTab('sub')">📱 Subscription</button>
+  <button class="tab" data-tab="settings" onclick="showTab('settings')">⚙️ تنظیمات</button>
   <button class="tab" data-tab="cleanup" onclick="showTab('cleanup')">🧹 پاک‌سازی</button>
 </div>
 
@@ -184,8 +201,11 @@ details[open] summary { margin-bottom: 10px; }
     <div class="stat"><div class="v blue" id="s-links">—</div><div class="l">لینک‌ها</div></div>
     <div class="stat"><div class="v" id="s-configs">—</div><div class="l">کل کانفیگ</div></div>
     <div class="stat"><div class="v yellow" id="s-tested">—</div><div class="l">تست‌شده</div></div>
-    <div class="stat"><div class="v green" id="s-reachable">—</div><div class="l">موفق</div></div>
-    <div class="stat"><div class="v red" id="s-failed">—</div><div class="l">ناموفق</div></div>
+    <div class="stat"><div class="v green" id="s-reachable">—</div><div class="l">اتصال عمومی ✓</div></div>
+    <div class="stat"><div class="v green" id="s-youtube">—</div><div class="l">YouTube ✓</div></div>
+    <div class="stat"><div class="v blue" id="s-speed">—</div><div class="l">سرعت‌سنجی‌شده</div></div>
+    <div class="stat"><div class="v green" id="s-eligible">—</div><div class="l">در خروجی</div></div>
+    <div class="stat"><div class="v red" id="s-failed">—</div><div class="l">ردشده</div></div>
     <div class="stat"><div class="v purple" id="s-unsupported">—</div><div class="l">پشتیبانی‌نشده</div></div>
     <div class="stat"><div class="v" id="s-pending">—</div><div class="l">در انتظار</div></div>
   </div>
@@ -202,6 +222,14 @@ details[open] summary { margin-bottom: 10px; }
         <small id="job-phase">—</small>
         <small id="job-eta">—</small>
       </div>
+      <div class="grid" style="margin-top:10px">
+        <div class="stat"><div class="v green mono" id="jd-general">—</div><div class="l">اتصال عمومی</div></div>
+        <div class="stat"><div class="v green mono" id="jd-youtube">—</div><div class="l">YouTube</div></div>
+        <div class="stat"><div class="v blue mono" id="jd-speed">—</div><div class="l">تست سرعت</div></div>
+        <div class="stat"><div class="v green mono" id="jd-eligible">—</div><div class="l">واجد شرایط</div></div>
+      </div>
+      <small id="job-plan" style="display:block;margin-top:8px"></small>
+      <div id="job-errors" class="errs" style="margin-top:8px"></div>
     </div>
     <div class="row mb" style="margin-top:12px">
       <button onclick="refreshAll(true)">🚀 دریافت + تست همه</button>
@@ -258,8 +286,9 @@ details[open] summary { margin-bottom: 10px; }
 
     <div class="filter-chips" id="config-chips">
       <span class="chip active" data-filter="all" onclick="setFilter('all')">همه <span class="count" id="c-all">0</span></span>
-      <span class="chip" data-filter="reachable" onclick="setFilter('reachable')">✅ موفق <span class="count" id="c-reachable">0</span></span>
-      <span class="chip" data-filter="failed" onclick="setFilter('failed')">❌ ناموفق <span class="count" id="c-failed">0</span></span>
+      <span class="chip" data-filter="reachable" onclick="setFilter('reachable')">✅ در خروجی <span class="count" id="c-reachable">0</span></span>
+      <span class="chip" data-filter="ytfail" onclick="setFilter('ytfail')">▶️ عمومی ✓ ولی YouTube ✗ <span class="count" id="c-ytfail">0</span></span>
+      <span class="chip" data-filter="failed" onclick="setFilter('failed')">❌ ردشده <span class="count" id="c-failed">0</span></span>
       <span class="chip" data-filter="untested" onclick="setFilter('untested')">⏳ تست‌نشده <span class="count" id="c-untested">0</span></span>
       <span class="chip" data-filter="unsupported" onclick="setFilter('unsupported')">🚫 پشتیبانی‌نشده <span class="count" id="c-unsupported">0</span></span>
     </div>
@@ -274,7 +303,9 @@ details[open] summary { margin-bottom: 10px; }
         <option value="ss">ss</option>
       </select>
       <select id="sort-by" style="max-width:200px">
+        <option value="score">مرتب: بهترین امتیاز</option>
         <option value="latency">مرتب: کمترین latency</option>
+        <option value="speed">مرتب: بیشترین سرعت</option>
         <option value="host">مرتب: host</option>
         <option value="protocol">مرتب: پروتکل</option>
       </select>
@@ -288,10 +319,12 @@ details[open] summary { margin-bottom: 10px; }
             <th style="width:70px">پروتکل</th>
             <th>host</th>
             <th style="width:60px">port</th>
-            <th style="width:80px">وضعیت</th>
-            <th style="width:70px">latency</th>
-            <th style="width:80px">کد</th>
-            <th>خطا</th>
+            <th style="width:80px">نتیجه</th>
+            <th style="width:110px">اتصال عمومی</th>
+            <th style="width:110px">YouTube</th>
+            <th style="width:150px">سرعت</th>
+            <th style="width:60px">امتیاز</th>
+            <th>خطاها</th>
             <th style="width:80px">عملیات</th>
           </tr>
         </thead>
@@ -304,7 +337,7 @@ details[open] summary { margin-bottom: 10px; }
 <!-- OUTPUT -->
 <div id="tab-output" class="tab-content hidden">
   <div class="card">
-    <h2>📤 خروجی نهایی (فقط کانفیگ‌های سالم، سریع‌ترین اول)</h2>
+    <h2>📤 خروجی نهایی (فقط کانفیگ‌های واجد شرایط؛ ترتیب طبق «رتبه‌بندی» در تنظیمات)</h2>
     <div class="row mb">
       <select id="out-format" style="max-width:200px">
         <option value="text">متن ساده</option>
@@ -358,9 +391,35 @@ details[open] summary { margin-bottom: 10px; }
     <details>
       <summary>⚠️ نکات امنیتی</summary>
       <p style="font-size:13px; color:var(--muted); margin:8px 0 0">
-        این URL توکن نمی‌خواد چون از طریق UI پروکسی می‌شه. هر کسی که به پورت 9090 دسترسی داشته باشه می‌تونه لیست کانفیگ‌ها رو ببینه. اگه این برات مهمه، پورت 9090 رو توی فایروال محدود به IP خودت کن.
+        این URL از سمت کلاینت توکن نمی‌خواد (اپ‌ها نمی‌تونن هدر بفرستن)؛ UI با توکن سرور (SUBSVC_AUTH_TOKEN) از طرف شما درخواست می‌کنه. بقیه‌ی API (تنظیمات، لینک‌ها، حذف) بدون توکن شما از طریق UI قابل دسترسی نیست. هر کسی که به پورت 9090 دسترسی داشته باشه می‌تونه لیست کانفیگ‌ها رو ببینه. اگه این برات مهمه، پورت 9090 رو توی فایروال محدود به IP خودت کن.
       </p>
     </details>
+  </div>
+</div>
+
+<!-- SETTINGS -->
+<div id="tab-settings" class="tab-content hidden">
+  <div class="card">
+    <div class="row mb" style="justify-content:space-between">
+      <h2 style="margin:0">⚙️ تنظیمات عملیاتی</h2>
+      <span id="settings-dirty" class="pill gray">بدون تغییر</span>
+    </div>
+    <small style="display:block;margin-bottom:12px">
+      این تنظیمات در سرور ذخیره می‌شن (settings.json در data_dir) و بعد از restart هم می‌مونن. تغییرات از <strong>کار بعدی</strong> اعمال می‌شن؛ کار در حال اجرا با تنظیمات قبلی تموم می‌شه.
+      معیار موفقیت و رتبه‌بندی فوراً روی «خروجی» و «کانفیگ‌ها» اثر می‌ذارن، بدون تست مجدد.
+    </small>
+    <div id="settings-form"></div>
+    <div class="row sticky-bar">
+      <button class="ok" onclick="saveSettings()">💾 ذخیره</button>
+      <button class="sec" onclick="loadSettings()">↩️ بازگردانی فرم</button>
+      <button class="danger" onclick="resetSettings()">♻️ بازگشت به پیش‌فرض‌ها</button>
+      <small id="settings-note"></small>
+    </div>
+  </div>
+  <div class="card">
+    <h2>🔒 تنظیمات استقرار (فقط‌خواندنی)</h2>
+    <small style="display:block;margin-bottom:10px">از متغیرهای محیطی <code>SUBSVC_*</code> خوانده می‌شن و در زمان اجرا قابل تغییر نیستن؛ برای تغییر، env یا docker-compose را عوض کنید و سرویس را restart کنید.</small>
+    <div class="kv" id="deployment-info"></div>
   </div>
 </div>
 
@@ -375,7 +434,7 @@ details[open] summary { margin-bottom: 10px; }
     <div class="danger-zone">
       <h3>❌ حذف کانفیگ‌های ناموفق</h3>
       <p style="margin:0 0 10px; font-size:13px">
-        کانفیگ‌هایی که تست شدن ولی پاسخ ندادن (timeout، خطای اتصال، ...).
+        کانفیگ‌هایی که تست شدن ولی معیارهای موفقیت (تنظیمات) را برآورده نمی‌کنند (timeout، YouTube، سرعت، ...).
       </p>
       <button class="danger" onclick="bulkDelete('failed')">🗑 حذف همه‌ی ناموفق‌ها</button>
     </div>
@@ -399,7 +458,7 @@ details[open] summary { margin-bottom: 10px; }
     <div class="danger-zone">
       <h3>🔴 حذف همه‌ی unreachable‌ها (ناموفق + تست‌نشده + پشتیبانی‌نشده)</h3>
       <p style="margin:0 0 10px; font-size:13px">
-        هر چیزی که reachable نیست. خطرناک‌ترین گزینه — فقط کانفیگ‌های سالم می‌مونن.
+        هر چیزی که در خروجی نیست. خطرناک‌ترین گزینه — فقط کانفیگ‌های واجد شرایط می‌مونن.
       </p>
       <button class="danger" onclick="bulkDelete('unreachable')">🗑 حذف همه‌ی unreachable‌ها</button>
     </div>
@@ -489,7 +548,7 @@ async function api(method, path, body) {
   const r = await fetch(API + path, opts);
   const txt = await r.text();
   let data; try { data = JSON.parse(txt); } catch { data = txt; }
-  if (!r.ok) throw new Error((data && data.error) || ("HTTP " + r.status));
+  if (!r.ok) { const err = new Error((data && data.error) || ("HTTP " + r.status)); err.data = data; throw err; }
   return data;
 }
 async function copyText(txt) {
@@ -523,6 +582,7 @@ function showTab(name) {
   if (name === "links") loadLinks();
   if (name === "configs") loadConfigs();
   if (name === "sub") updateSubUrl();
+  if (name === "settings") loadSettings();
 }
 
 // ---------- TOKEN ----------
@@ -681,8 +741,11 @@ async function loadStatus() {
     document.getElementById("s-configs").textContent = s.configs ?? "—";
     document.getElementById("s-tested").textContent = s.tested ?? "—";
     document.getElementById("s-reachable").textContent = s.reachable ?? "—";
+    document.getElementById("s-youtube").textContent = s.youtube_ok ?? "—";
+    document.getElementById("s-speed").textContent = s.speed_tested ?? "—";
+    document.getElementById("s-eligible").textContent = s.eligible ?? "—";
     document.getElementById("s-unsupported").textContent = s.unsupported ?? "—";
-    const failed = (s.tested || 0) - (s.reachable || 0);
+    const failed = (s.tested || 0) - (s.eligible || 0);
     document.getElementById("s-failed").textContent = failed >= 0 ? failed : "—";
     const pending = (s.configs || 0) - (s.tested || 0);
     document.getElementById("s-pending").textContent = pending >= 0 ? pending : "—";
@@ -706,6 +769,16 @@ async function loadStatus() {
       ? `${done} / ${total}  (${pct.toFixed(1)}%)`
       : (j.state === "running" ? "شروع..." : "—");
     document.getElementById("job-phase").textContent = j.phase || "";
+    const pl = j.plan || {};
+    document.getElementById("jd-general").textContent = total > 0 ? `${j.tests_reachable || 0} / ${done}` : "—";
+    document.getElementById("jd-youtube").textContent = !total ? "—" : (pl.youtube === false ? "غیرفعال" : `${j.tests_youtube_ok || 0} / ${done}`);
+    document.getElementById("jd-speed").textContent = !total ? "—" : (pl.speed === false ? "غیرفعال" : `${j.tests_speed_ok || 0} / ${j.tests_speed_done || 0}`);
+    document.getElementById("jd-eligible").textContent = total > 0 ? `${j.tests_eligible || 0} / ${done}` : "—";
+    document.getElementById("job-plan").textContent = pl.concurrency
+      ? `تنظیمات این کار: ${pl.concurrency} تست هم‌زمان` + (pl.speed ? ` · سرعت‌سنجی با ${pl.speed_concurrency} دانلود هم‌زمان` : "")
+      : "";
+    const errBox = document.getElementById("job-errors");
+    errBox.innerHTML = (j.errors || []).slice(0, 5).map(e => `<small title="${esc(e)}">⚠️ ${esc(e)}</small>`).join("");
 
     let etaTxt = "—";
     if (j.state === "running" && done > 0 && total > 0 && j.started_at) {
@@ -728,7 +801,14 @@ async function loadStatus() {
   }
 }
 
-// ---------- CONFIGS ----------
+// ---------- CONFIGS
+const KIND_LABEL = { timeout: "Timeout", dns: "DNS", tls: "TLS", connect: "اتصال", http_status: "HTTP", cancelled: "لغو", other: "خطا" };
+function fmtBytes(n) {
+  if (n == null) return "—";
+  if (n < 1024) return n + " B";
+  if (n < 1048576) return (n / 1024).toFixed(0) + " KB";
+  return (n / 1048576).toFixed(2) + " MB";
+}
 function setFilter(f) {
   currentFilter = f;
   document.querySelectorAll(".chip").forEach(el => el.classList.toggle("active", el.dataset.filter === f));
@@ -747,20 +827,60 @@ async function loadConfigs() {
   } catch(e) { toast("✗ " + e.message, "err"); }
 }
 
+function ytFailed(c) {
+  const t = c.test || {};
+  return !!(t.general && t.general.ok && t.youtube && t.youtube.tested && !t.youtube.ok);
+}
 function updateFilterCounts() {
-  let reachable = 0, failed = 0, untested = 0, unsupported = 0;
+  let eligible = 0, failed = 0, untested = 0, unsupported = 0, ytfail = 0;
   for (const c of allConfigs) {
     const t = c.test || {};
     if (c.unsupported) { unsupported++; continue; }
-    if (t.reachable === true) reachable++;
+    if (c.eligible) eligible++;
     else if (t.tested === true) failed++;
     else untested++;
+    if (ytFailed(c)) ytfail++;
   }
   document.getElementById("c-all").textContent = allConfigs.length;
-  document.getElementById("c-reachable").textContent = reachable;
+  document.getElementById("c-reachable").textContent = eligible;
+  document.getElementById("c-ytfail").textContent = ytfail;
   document.getElementById("c-failed").textContent = failed;
   document.getElementById("c-untested").textContent = untested;
   document.getElementById("c-unsupported").textContent = unsupported;
+}
+
+function probeCell(p) {
+  if (!p || !p.tested) return '<span class="pill gray">—</span>';
+  if (p.ok) {
+    return `<div class="cell"><span class="pill green">OK</span> <span class="mono">${p.latency_ms}ms</span>` +
+           `<small>اتصال ${p.connect_ms}ms · پاسخ ${p.response_ms}ms</small></div>`;
+  }
+  const kind = KIND_LABEL[p.error_kind] || "خطا";
+  const code = p.status_code ? ` ${p.status_code}` : "";
+  return `<span class="pill red" title="${esc(p.error)}">${esc(kind + code)}</span>`;
+}
+function speedCell(sp) {
+  if (!sp) return '<span class="pill gray">—</span>';
+  if (sp.skipped) return `<span class="pill gray" title="${esc(sp.skipped)}">رد شد</span>`;
+  if (!sp.tested) return '<span class="pill gray">—</span>';
+  if (sp.ok) {
+    return `<div class="cell"><span class="mono"><strong>${sp.mbps}</strong> Mbps</span>` +
+           `<small>${fmtBytes(sp.bytes)} در ${fmtMs(sp.duration_ms)}</small></div>`;
+  }
+  const kind = KIND_LABEL[sp.error_kind] || "خطا";
+  return `<div class="cell"><span class="pill red" title="${esc(sp.error)}">${esc(kind)}</span>` +
+         (sp.bytes ? `<small>${fmtBytes(sp.bytes)} (ناقص)</small>` : "") + `</div>`;
+}
+function errorsCell(c) {
+  const t = c.test || {};
+  const lines = [];
+  if (c.unsupported) lines.push(["", c.unsupported]);
+  if (t.general && t.general.error) lines.push(["G", t.general.error]);
+  if (t.youtube && t.youtube.error) lines.push(["Y", t.youtube.error]);
+  if (t.speed && t.speed.error) lines.push(["S", t.speed.error]);
+  if (!t.general && t.error) lines.push(["", t.error]);
+  return '<div class="errs">' + lines.map(([k, m]) =>
+    `<small title="${esc(m)}">${k ? k + ": " : ""}${esc(m)}</small>`).join("") + "</div>";
 }
 
 function renderConfigs() {
@@ -770,19 +890,25 @@ function renderConfigs() {
   let list = allConfigs.filter(c => {
     if (protoF && c.protocol !== protoF) return false;
     const t = c.test || {};
-    if (currentFilter === "reachable") return t.reachable === true;
-    if (currentFilter === "failed") return t.tested === true && t.reachable === false && !c.unsupported;
+    if (currentFilter === "reachable") return c.eligible === true;
+    if (currentFilter === "ytfail") return ytFailed(c);
+    if (currentFilter === "failed") return t.tested === true && !c.eligible && !c.unsupported;
     if (currentFilter === "untested") return t.tested !== true && !c.unsupported;
     if (currentFilter === "unsupported") return !!c.unsupported;
     return true;
   });
 
+  const lat = c => {
+    const g = c.test && c.test.general, y = c.test && c.test.youtube;
+    if (g && g.ok) return g.latency_ms;
+    if (y && y.ok) return y.latency_ms;
+    return Infinity;
+  };
+  const spd = c => (c.test && c.test.speed && c.test.speed.ok) ? c.test.speed.mbps : -1;
   list.sort((a, b) => {
-    if (sortBy === "latency") {
-      const la = (a.test && a.test.reachable) ? a.test.latency_ms : Infinity;
-      const lb = (b.test && b.test.reachable) ? b.test.latency_ms : Infinity;
-      return la - lb;
-    }
+    if (sortBy === "score") return (b.score || 0) - (a.score || 0) || lat(a) - lat(b);
+    if (sortBy === "latency") return lat(a) - lat(b);
+    if (sortBy === "speed") return spd(b) - spd(a) || lat(a) - lat(b);
     if (sortBy === "host") return (a.host || "").localeCompare(b.host || "");
     if (sortBy === "protocol") return (a.protocol || "").localeCompare(b.protocol || "");
     return 0;
@@ -796,20 +922,17 @@ function renderConfigs() {
     `<small>نمایش ${slice.length} از ${list.length} کانفیگ (از کل ${allConfigs.length})</small>`;
 
   if (slice.length === 0) {
-    tb.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:20px">چیزی مطابق فیلتر پیدا نشد</td></tr>';
+    tb.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">چیزی مطابق فیلتر پیدا نشد</td></tr>';
     return;
   }
 
   slice.forEach(c => {
     const t = c.test || {};
-    let pillClass = "gray", pillText = "—";
+    let pillClass, pillText;
     if (c.unsupported) { pillClass = "gray"; pillText = "unsupported"; }
-    else if (t.reachable === true) { pillClass = "green"; pillText = "OK"; }
+    else if (c.eligible) { pillClass = "green"; pillText = "OK"; }
     else if (t.tested === true) { pillClass = "red"; pillText = "fail"; }
     else { pillClass = "yellow"; pillText = "untested"; }
-
-    const latency = (t.reachable && t.latency_ms) ? t.latency_ms + "ms" : "—";
-    const err = (t.error || "").slice(0, 60);
 
     const uriEsc = esc(c.uri).replace(/'/g, "\\'");
     const keyEsc = esc(c.key).replace(/'/g, "\\'");
@@ -817,12 +940,14 @@ function renderConfigs() {
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td><span class="tag">${esc(c.protocol)}</span></td>
-      <td class="mono" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(c.host)}">${esc(c.host)}</td>
+      <td class="mono" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(c.host)}">${esc(c.host)}</td>
       <td class="mono">${c.port}</td>
       <td><span class="pill ${pillClass}">${pillText}</span></td>
-      <td class="mono">${latency}</td>
-      <td class="mono">${t.status_code || "—"}</td>
-      <td><small style="color:var(--red)">${esc(err)}</small></td>
+      <td>${probeCell(t.general)}</td>
+      <td>${probeCell(t.youtube)}</td>
+      <td>${speedCell(t.speed)}</td>
+      <td class="mono">${c.eligible ? (c.score ?? 0).toFixed(1) : "—"}</td>
+      <td>${errorsCell(c)}</td>
       <td>
         <button class="ghost" onclick="copyText('${uriEsc}')" title="کپی URI">📋</button>
         <button class="ghost" style="color:var(--red)" onclick="deleteOneConfig('${keyEsc}')" title="حذف">🗑</button>
@@ -896,6 +1021,167 @@ async function downloadOutput() {
   a.download = "subsvc-" + fmt + "-" + Date.now() + ".txt";
   a.click();
   URL.revokeObjectURL(a.href);
+}
+
+// ---------- SETTINGS ----------
+// Every field here is a real, validated backend setting (PUT /api/settings).
+const SETTINGS_SCHEMA = [
+  { sec: "اجرای تست", fields: [
+    { k: "test_concurrency", t: "int", l: "تعداد تست هم‌زمان", limit: "max_test_concurrency",
+      h: "هر تست یک پردازش Xray است. روی سرور ۲ هسته/۲ گیگ، ۱۰ مقدار مناسبیه." },
+    { k: "timeout_ms", t: "int", l: "Timeout هر تست اتصال (ms)", h: "برای اتصال عمومی و YouTube (هر کدام جدا)" },
+    { k: "startup_timeout_ms", t: "int", l: "مهلت بالا آمدن هسته Xray (ms)" },
+  ]},
+  { sec: "تست‌های اتصال", fields: [
+    { k: "general_url", t: "url", l: "آدرس تست عمومی", h: "باید با HTTP 204 جواب بده" },
+    { k: "youtube_enabled", t: "bool", l: "تست YouTube فعال باشد" },
+    { k: "youtube_url", t: "url", l: "آدرس تست YouTube", h: "باید با HTTP 204 جواب بده" },
+  ]},
+  { sec: "تست سرعت", fields: [
+    { k: "speed_enabled", t: "bool", l: "تست سرعت فعال باشد", h: "فقط برای کانفیگ‌هایی که تست‌های اتصال لازم را پاس کنند" },
+    { k: "speed_url", t: "url", l: "آدرس دانلود", h: "می‌تواند شامل {bytes} باشد؛ با «حداکثر حجم» جایگزین می‌شود" },
+    { k: "speed_max_bytes", t: "int", l: "حداکثر حجم دانلود (bytes)", limit: "max_speed_bytes", bytes: true },
+    { k: "speed_timeout_ms", t: "int", l: "Timeout تست سرعت (ms)" },
+    { k: "speed_concurrency", t: "int", l: "دانلود هم‌زمان", h: "کم نگه دارید تا اندازه‌گیری‌ها به هم اثر نذارن", limit: "max_test_concurrency" },
+  ]},
+  { sec: "معیار موفقیت (چه چیزی وارد خروجی می‌شود)", fields: [
+    { k: "require_general", t: "bool", l: "اتصال عمومی الزامی باشد" },
+    { k: "require_youtube", t: "bool", l: "YouTube الزامی باشد", h: "نیازمند فعال‌بودن تست YouTube" },
+    { k: "max_latency_ms", t: "int", l: "حداکثر latency (ms)", h: "۰ = بدون محدودیت" },
+    { k: "min_speed_mbps", t: "float", l: "حداقل سرعت (Mbps)", h: "۰ = بدون محدودیت؛ نیازمند تست سرعت" },
+  ]},
+  { sec: "رتبه‌بندی خروجی", fields: [
+    { k: "rank_mode", t: "select", l: "روش رتبه‌بندی", options: [["score", "امتیاز (latency + سرعت)"], ["latency", "فقط latency"], ["speed", "فقط سرعت"]] },
+    { k: "rank_weight_latency", t: "int", l: "وزن latency در امتیاز (۰–۱۰۰)" },
+    { k: "rank_weight_speed", t: "int", l: "وزن سرعت در امتیاز (۰–۱۰۰)" },
+    { k: "speed_ref_mbps", t: "float", l: "سرعتی که امتیاز کامل می‌گیرد (Mbps)" },
+  ]},
+  { sec: "دریافت اشتراک‌ها", fields: [
+    { k: "fetch_timeout_sec", t: "int", l: "Timeout دریافت (ثانیه)" },
+    { k: "fetch_concurrency", t: "int", l: "دریافت هم‌زمان (۱–۴)" },
+    { k: "fetch_max_body_bytes", t: "int", l: "حداکثر حجم پاسخ اشتراک (bytes)", bytes: true },
+    { k: "user_agent", t: "text", l: "User-Agent" },
+  ]},
+];
+let settingsLoaded = null;   // last values from the server
+let settingsLimits = {};
+
+function fieldEl(k) { return document.getElementById("set-" + k); }
+function buildSettingsForm() {
+  const root = document.getElementById("settings-form");
+  root.innerHTML = "";
+  for (const sec of SETTINGS_SCHEMA) {
+    const box = document.createElement("div");
+    box.className = "settings-section";
+    box.innerHTML = `<h3>${esc(sec.sec)}</h3><div class="settings-grid"></div>`;
+    const grid = box.querySelector(".settings-grid");
+    for (const f of sec.fields) {
+      const d = document.createElement("div");
+      d.className = "field"; d.id = "fld-" + f.k;
+      let input;
+      if (f.t === "bool") {
+        input = `<label class="chk"><input type="checkbox" id="set-${f.k}"><span>${esc(f.l)}</span></label>`;
+      } else if (f.t === "select") {
+        input = `<label class="lbl" for="set-${f.k}">${esc(f.l)}</label><select id="set-${f.k}">` +
+          f.options.map(([v, t]) => `<option value="${v}">${esc(t)}</option>`).join("") + "</select>";
+      } else if (f.t === "int" || f.t === "float") {
+        input = `<label class="lbl" for="set-${f.k}">${esc(f.l)}</label>` +
+          `<input type="number" id="set-${f.k}" step="${f.t === "int" ? 1 : "any"}" min="0">`;
+      } else {
+        input = `<label class="lbl" for="set-${f.k}">${esc(f.l)}</label><input type="text" class="ltr" id="set-${f.k}" autocomplete="off">`;
+      }
+      d.innerHTML = input + `<div class="hint" id="hint-${f.k}"></div><div class="err" id="err-${f.k}"></div>`;
+      grid.appendChild(d);
+      d.addEventListener("input", markSettingsDirty);
+      d.addEventListener("change", markSettingsDirty);
+    }
+    root.appendChild(box);
+  }
+}
+function allSettingFields() { return SETTINGS_SCHEMA.flatMap(s => s.fields); }
+
+function fillSettings(values) {
+  for (const f of allSettingFields()) {
+    const el = fieldEl(f.k); if (!el) continue;
+    if (f.t === "bool") el.checked = !!values[f.k]; else el.value = values[f.k];
+    let hint = f.h || "";
+    if (f.limit && settingsLimits[f.limit] != null) hint += (hint ? " — " : "") + "سقف استقرار: " + settingsLimits[f.limit] + (f.bytes ? " bytes" : "");
+    if (f.bytes) hint += (hint ? " — " : "") + "≈ " + fmtBytes(Number(values[f.k]));
+    document.getElementById("hint-" + f.k).textContent = hint;
+    document.getElementById("fld-" + f.k).classList.remove("invalid");
+    document.getElementById("err-" + f.k).textContent = "";
+  }
+  markSettingsDirty();
+}
+function readSettings() {
+  const out = {}, errs = {};
+  for (const f of allSettingFields()) {
+    const el = fieldEl(f.k);
+    if (f.t === "bool") out[f.k] = el.checked;
+    else if (f.t === "int" || f.t === "float") {
+      const raw = el.value.trim(); const v = Number(raw);
+      if (raw === "" || !Number.isFinite(v) || (f.t === "int" && !Number.isInteger(v))) errs[f.k] = "عدد معتبر وارد کنید";
+      else out[f.k] = v;
+    } else out[f.k] = el.value.trim();
+  }
+  return { out, errs };
+}
+function markSettingsDirty() {
+  const pill = document.getElementById("settings-dirty");
+  if (!settingsLoaded) return;
+  const { out } = readSettings();
+  const dirty = allSettingFields().some(f => out[f.k] !== undefined && out[f.k] !== settingsLoaded[f.k]);
+  pill.textContent = dirty ? "تغییرات ذخیره‌نشده" : "بدون تغییر";
+  pill.className = "pill " + (dirty ? "yellow" : "gray");
+}
+function showSettingErrors(fields) {
+  for (const f of allSettingFields()) {
+    const msg = fields[f.k];
+    document.getElementById("fld-" + f.k).classList.toggle("invalid", !!msg);
+    document.getElementById("err-" + f.k).textContent = msg || "";
+  }
+}
+function renderDeployment(dep) {
+  const labels = { listen: "SUBSVC_LISTEN", data_dir: "SUBSVC_DATA_DIR", log_level: "SUBSVC_LOG_LEVEL", core_path: "SUBSVC_CORE_PATH",
+    auth: "احراز هویت API", auth_token_source: "منبع توکن", max_test_concurrency: "SUBSVC_MAX_TEST_CONCURRENCY",
+    max_speed_bytes: "SUBSVC_MAX_SPEED_BYTES", allow_private_test_url: "SUBSVC_ALLOW_PRIVATE_TEST_URLS" };
+  document.getElementById("deployment-info").innerHTML = Object.keys(labels).filter(k => k in dep).map(k =>
+    `<div class="k">${esc(labels[k])}</div><div class="v">${esc(dep[k] === true ? "فعال" : dep[k] === false ? "غیرفعال" : dep[k] === "" ? "—" : dep[k])}</div>`).join("");
+}
+
+async function loadSettings() {
+  if (!document.getElementById("settings-form").children.length) buildSettingsForm();
+  try {
+    const d = await api("GET", "/api/settings");
+    settingsLoaded = d.settings; settingsLimits = d.limits || {};
+    fillSettings(d.settings);
+    renderDeployment(d.deployment || {});
+    document.getElementById("settings-note").textContent = "";
+  } catch (e) { toast("✗ " + e.message, "err"); }
+}
+async function saveSettings() {
+  const { out, errs } = readSettings();
+  if (Object.keys(errs).length) { showSettingErrors(errs); return toast("✗ مقادیر نامعتبر", "err"); }
+  try {
+    const d = await api("PUT", "/api/settings", out);
+    settingsLoaded = d.settings; settingsLimits = d.limits || settingsLimits;
+    fillSettings(d.settings);
+    document.getElementById("settings-note").textContent = d.note || "";
+    toast("✓ تنظیمات ذخیره شد", "ok");
+    loadStatus();
+  } catch (e) {
+    // the API returns {error, fields:{name: message}}
+    if (e.data && e.data.fields) showSettingErrors(e.data.fields);
+    toast("✗ " + e.message, "err", 5000);
+  }
+}
+async function resetSettings() {
+  if (!confirm("همه‌ی تنظیمات عملیاتی به پیش‌فرض برگردند؟")) return;
+  try {
+    const d = await api("POST", "/api/settings/reset");
+    settingsLoaded = d.settings; fillSettings(d.settings);
+    toast("✓ به پیش‌فرض برگشت", "ok");
+  } catch (e) { toast("✗ " + e.message, "err"); }
 }
 
 // ---------- SUBSCRIPTION ----------

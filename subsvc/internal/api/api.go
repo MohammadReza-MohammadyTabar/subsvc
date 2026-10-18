@@ -6,27 +6,34 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"subsvc/internal/service"
+	"subsvc/internal/settings"
 	"subsvc/internal/store"
 )
 
 // Server holds the handlers.
 type Server struct {
-	svc   *service.Service
-	log   *slog.Logger
-	token string
+	svc        *service.Service
+	log        *slog.Logger
+	token      string
+	cfg        *settings.Manager
+	deployment map[string]any // non-secret deployment values, shown read-only
 }
 
-// New returns the HTTP handler. An empty token disables authentication.
-func New(svc *service.Service, log *slog.Logger, token string) http.Handler {
-	s := &Server{svc: svc, log: log, token: token}
+// New returns the HTTP handler. An empty token disables authentication
+// (main only allows that when the service listens on loopback).
+func New(svc *service.Service, log *slog.Logger, token string, cfg *settings.Manager, deployment map[string]any) http.Handler {
+	s := &Server{svc: svc, log: log, token: token, cfg: cfg, deployment: deployment}
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -35,6 +42,10 @@ func New(svc *service.Service, log *slog.Logger, token string) http.Handler {
 	})
 
 	mux.HandleFunc("GET /api/status", s.status)
+
+	mux.HandleFunc("GET /api/settings", s.getSettings)
+	mux.HandleFunc("PUT /api/settings", s.putSettings)
+	mux.HandleFunc("POST /api/settings/reset", s.resetSettings)
 
 	mux.HandleFunc("GET /api/links", s.listLinks)
 	mux.HandleFunc("POST /api/links", s.addLink)
@@ -315,6 +326,9 @@ func (s *Server) cancel(w http.ResponseWriter, r *http.Request) {
 // ----------------------------------------------------------------- configs
 
 // GET /api/configs?reachable=true&link=ID
+// Every config with its separate general / youtube / speed results plus the
+// derived "eligible" and "score". reachable=true returns only the configs that
+// meet the current success criteria, ranked like the output.
 func (s *Server) configs(w http.ResponseWriter, r *http.Request) {
 	reachable, err := queryBool(r, "reachable", false)
 	if err != nil {
@@ -328,11 +342,12 @@ func (s *Server) configs(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	set := s.cfg.Get()
 	if reachable {
-		writeJSON(w, http.StatusOK, s.svc.Store().Reachable(link))
+		writeJSON(w, http.StatusOK, s.svc.Store().Selected(link, set))
 		return
 	}
-	writeJSON(w, http.StatusOK, s.svc.Store().Entries(link))
+	writeJSON(w, http.StatusOK, s.svc.Store().Views(link, set))
 }
 
 // DELETE /api/configs/{key...}
@@ -377,7 +392,7 @@ func (s *Server) deleteConfigsBulk(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	n, err := s.svc.Store().DeleteEntries(filter, link)
+	n, err := s.svc.Store().DeleteEntries(filter, link, s.cfg.Get())
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -392,11 +407,11 @@ func (s *Server) deleteConfigsBulk(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/output?format=text|base64&link=ID&limit=N&name=NEW&numbered=true
 //
-// Only configs whose last real test succeeded, fastest first.
+// Only configs that meet the success criteria, best first (rank_mode).
 //
 // Optional query params:
 //   - name=STRING   : replace the display name (fragment / vmess "ps") of every
-//                     emitted config with this string.
+//     emitted config with this string.
 //   - numbered=true : append " 1", " 2", ... to the name so each line is unique.
 //
 // Example:
@@ -429,7 +444,7 @@ func (s *Server) output(w http.ResponseWriter, r *http.Request) {
 	nameOverride := q.Get("name")
 	numbered := q.Get("numbered") == "true"
 
-	list := s.svc.Store().Reachable(link)
+	list := s.svc.Store().Selected(link, s.cfg.Get())
 	if limit > 0 && len(list) > limit {
 		list = list[:limit]
 	}
@@ -502,4 +517,85 @@ func renameURI(uri, name string) string {
 		base = uri[:i]
 	}
 	return base + "#" + url.PathEscape(name)
+}
+
+// ---------------------------------------------------------------- settings
+
+type settingsResponse struct {
+	Settings   settings.Settings `json:"settings"`
+	Defaults   settings.Settings `json:"defaults"`
+	Limits     map[string]any    `json:"limits"`
+	Deployment map[string]any    `json:"deployment"` // read-only, from SUBSVC_* environment variables
+	Note       string            `json:"note,omitempty"`
+}
+
+func (s *Server) settingsResponse(cur settings.Settings, note string) settingsResponse {
+	lim := s.cfg.Limits()
+	return settingsResponse{
+		Settings: cur,
+		Defaults: settings.Default(),
+		Limits: map[string]any{"max_test_concurrency": lim.MaxTestConcurrency,
+			"max_speed_bytes": lim.MaxSpeedBytes},
+		Deployment: s.deployment,
+		Note:       note,
+	}
+}
+
+// GET /api/settings
+func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.settingsResponse(s.cfg.Get(), ""))
+}
+
+// PUT /api/settings   body: any subset of the settings fields
+// Fields that are not present keep their value. The whole result is validated
+// and stored atomically; on any error nothing changes. A running job keeps the
+// settings it started with; the change applies to the next job.
+func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "request body too large or unreadable")
+		return
+	}
+	before := s.cfg.Get()
+	cur, err := s.cfg.Update(body)
+	if err != nil {
+		var ve *settings.ValidationError
+		if errors.As(err, &ve) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": ve.Error(), "fields": ve.Fields})
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.log.Info("settings updated", "changed", changedFields(before, cur))
+	writeJSON(w, http.StatusOK, s.settingsResponse(cur, "applies to the next job; a running job keeps its settings"))
+}
+
+// POST /api/settings/reset
+func (s *Server) resetSettings(w http.ResponseWriter, r *http.Request) {
+	cur, err := s.cfg.Reset()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.log.Info("settings reset to defaults")
+	writeJSON(w, http.StatusOK, s.settingsResponse(cur, "applies to the next job; a running job keeps its settings"))
+}
+
+// changedFields lists the names (not the values) of the fields that differ.
+func changedFields(a, b settings.Settings) []string {
+	ja, _ := json.Marshal(a)
+	jb, _ := json.Marshal(b)
+	var ma, mb map[string]any
+	_ = json.Unmarshal(ja, &ma)
+	_ = json.Unmarshal(jb, &mb)
+	var out []string
+	for k, v := range mb {
+		if !reflect.DeepEqual(ma[k], v) {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out
 }

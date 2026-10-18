@@ -7,7 +7,8 @@ Wants=network-online.target
 Type=simple
 User=subsvc
 Group=subsvc
-ExecStart=/usr/local/bin/subsvc -config /etc/subsvc/config.json
+EnvironmentFile=-/etc/subsvc/subsvc.env
+ExecStart=/usr/local/bin/subsvc
 Restart=on-failure
 RestartSec=3
 

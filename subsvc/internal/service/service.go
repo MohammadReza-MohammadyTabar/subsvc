@@ -13,8 +13,10 @@ import (
 
 	"subsvc/internal/model"
 	"subsvc/internal/proxy"
+	"subsvc/internal/settings"
 	"subsvc/internal/store"
 	"subsvc/internal/subscription"
+	"subsvc/internal/tester"
 )
 
 var (
@@ -29,32 +31,43 @@ type Fetcher interface {
 	Fetch(ctx context.Context, url string) (*subscription.Result, error)
 }
 
+// FetcherFactory builds a Fetcher from the settings snapshot of a job, so that
+// changes made in the UI apply to the next job.
+type FetcherFactory func(s settings.Settings) Fetcher
+
 // Prober tests one config through its own proxy.
 type Prober interface {
-	Test(ctx context.Context, n *proxy.Node) model.TestResult
-}
-
-// Options configures the service.
-type Options struct {
-	FetchConcurrency int
-	TestConcurrency  int
+	Test(ctx context.Context, n *proxy.Node, s settings.Settings, gate tester.Gate) model.TestResult
 }
 
 // Job describes a running or finished job.
 type Job struct {
-	ID         int        `json:"id"`
-	Kind       string     `json:"kind"`  // refresh | test
-	State      string     `json:"state"` // running | done | cancelled
-	Phase      string     `json:"phase"` // fetching | testing | finished
-	StartedAt  time.Time  `json:"started_at"`
-	FinishedAt *time.Time `json:"finished_at,omitempty"`
-	LinksTotal int        `json:"links_total"`
-	LinksDone  int        `json:"links_done"`
-	LinksFail  int        `json:"links_failed"`
-	TestTotal  int        `json:"tests_total"`
-	TestDone   int        `json:"tests_done"`
-	TestOK     int        `json:"tests_reachable"`
-	Errors     []string   `json:"errors,omitempty"`
+	ID          int        `json:"id"`
+	Kind        string     `json:"kind"`  // refresh | test
+	State       string     `json:"state"` // running | done | cancelled
+	Phase       string     `json:"phase"` // fetching | testing | finished
+	StartedAt   time.Time  `json:"started_at"`
+	FinishedAt  *time.Time `json:"finished_at,omitempty"`
+	LinksTotal  int        `json:"links_total"`
+	LinksDone   int        `json:"links_done"`
+	LinksFail   int        `json:"links_failed"`
+	TestTotal   int        `json:"tests_total"`
+	TestDone    int        `json:"tests_done"`
+	TestOK      int        `json:"tests_reachable"` // general probe succeeded
+	TestYT      int        `json:"tests_youtube_ok"`
+	TestSpeed   int        `json:"tests_speed_done"` // speed downloads finished (ok or not)
+	TestSpeedOK int        `json:"tests_speed_ok"`
+	TestElig    int        `json:"tests_eligible"` // meet the success criteria
+	Plan        *Plan      `json:"plan,omitempty"` // what this job tests
+	Errors      []string   `json:"errors,omitempty"`
+}
+
+// Plan is the settings snapshot a job runs with.
+type Plan struct {
+	Concurrency      int  `json:"concurrency"`
+	YouTube          bool `json:"youtube"`
+	Speed            bool `json:"speed"`
+	SpeedConcurrency int  `json:"speed_concurrency"`
 }
 
 // Status is returned by the status endpoint.
@@ -68,9 +81,9 @@ type Status struct {
 type Service struct {
 	log   *slog.Logger
 	st    *store.Store
-	fetch Fetcher
+	fetch FetcherFactory
 	probe Prober
-	opt   Options
+	cfg   *settings.Manager
 
 	mu     sync.Mutex
 	job    *Job // current or last job
@@ -80,14 +93,8 @@ type Service struct {
 }
 
 // New creates a Service.
-func New(log *slog.Logger, st *store.Store, f Fetcher, p Prober, o Options) *Service {
-	if o.FetchConcurrency < 1 {
-		o.FetchConcurrency = 1
-	}
-	if o.TestConcurrency < 1 {
-		o.TestConcurrency = 1
-	}
-	return &Service{log: log, st: st, fetch: f, probe: p, opt: o}
+func New(log *slog.Logger, st *store.Store, f FetcherFactory, p Prober, cfg *settings.Manager) *Service {
+	return &Service{log: log, st: st, fetch: f, probe: p, cfg: cfg}
 }
 
 // Store exposes the underlying store (read access for the API layer).
@@ -103,7 +110,7 @@ func (s *Service) Status() Status {
 		j = &c
 	}
 	s.mu.Unlock()
-	return Status{Job: j, Stats: s.st.Stats(), Links: s.st.Links()}
+	return Status{Job: j, Stats: s.st.Stats(s.cfg.Get()), Links: s.st.Links()}
 }
 
 // Cancel stops the running job. It reports whether a job was running.
@@ -186,18 +193,19 @@ func (s *Service) StartRefresh(linkID string, test bool) (Job, error) {
 	if err != nil {
 		return Job{}, err
 	}
+	set := s.snapshot()
 	snap := *job
 	go func() {
 		defer s.finish(ctx)
 		defer s.recoverJob()
 		s.update(func(j *Job) { j.LinksTotal = len(links) })
-		s.fetchAll(ctx, links)
+		s.fetchAll(ctx, links, set)
 		if test && ctx.Err() == nil {
 			ids := make([]string, len(links))
 			for i, l := range links {
 				ids[i] = l.ID
 			}
-			s.runTests(ctx, s.st.EntriesForLinks(ids), false)
+			s.runTests(ctx, s.st.EntriesForLinks(ids), false, set)
 		}
 	}()
 	return snap, nil
@@ -215,13 +223,25 @@ func (s *Service) StartTest(linkID string, onlyUntested bool) (Job, error) {
 	if err != nil {
 		return Job{}, err
 	}
+	set := s.snapshot()
 	snap := *job
 	go func() {
 		defer s.finish(ctx)
 		defer s.recoverJob()
-		s.runTests(ctx, s.st.Entries(linkID), onlyUntested)
+		s.runTests(ctx, s.st.Entries(linkID), onlyUntested, set)
 	}()
 	return snap, nil
+}
+
+// snapshot takes the settings a job runs with and records the plan in the job,
+// so a change made in the UI never alters a job that is already running.
+func (s *Service) snapshot() settings.Settings {
+	set := s.cfg.Get()
+	s.update(func(j *Job) {
+		j.Plan = &Plan{Concurrency: set.TestConcurrency, YouTube: set.YouTubeEnabled,
+			Speed: set.SpeedEnabled, SpeedConcurrency: set.SpeedConcurrency}
+	})
+	return set
 }
 
 func (s *Service) recoverJob() {
@@ -250,8 +270,9 @@ func (s *Service) selectLinks(linkID string) ([]model.Link, error) {
 
 // fetchAll downloads the given links with limited concurrency. A failing link
 // is recorded and skipped; its previously stored configs are left untouched.
-func (s *Service) fetchAll(ctx context.Context, links []model.Link) {
-	sem := make(chan struct{}, s.opt.FetchConcurrency)
+func (s *Service) fetchAll(ctx context.Context, links []model.Link, set settings.Settings) {
+	fetcher := s.fetch(set)
+	sem := make(chan struct{}, set.FetchConcurrency)
 	var wg sync.WaitGroup
 	for _, l := range links {
 		if ctx.Err() != nil {
@@ -268,15 +289,15 @@ func (s *Service) fetchAll(ctx context.Context, links []model.Link) {
 					s.update(func(j *Job) { j.LinksDone++; j.LinksFail++ })
 				}
 			}()
-			s.fetchOne(ctx, l)
+			s.fetchOne(ctx, fetcher, l)
 		}(l)
 	}
 	wg.Wait()
 }
 
-func (s *Service) fetchOne(ctx context.Context, l model.Link) {
+func (s *Service) fetchOne(ctx context.Context, fetcher Fetcher, l model.Link) {
 	start := time.Now()
-	res, err := s.fetch.Fetch(ctx, l.URL)
+	res, err := fetcher.Fetch(ctx, l.URL)
 	st := model.FetchStatus{At: start.UTC(), DurationMS: time.Since(start).Milliseconds()}
 	if res != nil {
 		st.HTTPStatus, st.Bytes = res.HTTPStatus, res.Bytes
@@ -305,8 +326,9 @@ func (s *Service) fetchOne(ctx context.Context, l model.Link) {
 	s.update(func(j *Job) { j.LinksDone++ })
 }
 
-// runTests tests entries with at most TestConcurrency probes in parallel.
-func (s *Service) runTests(ctx context.Context, entries []model.Entry, onlyUntested bool) {
+// runTests tests entries with at most set.TestConcurrency configs in parallel
+// (one core process each) and set.SpeedConcurrency speed downloads at a time.
+func (s *Service) runTests(ctx context.Context, entries []model.Entry, onlyUntested bool, set settings.Settings) {
 	var todo []model.Entry
 	for _, e := range entries {
 		if e.Unsupported != "" {
@@ -322,9 +344,10 @@ func (s *Service) runTests(ctx context.Context, entries []model.Entry, onlyUntes
 		return
 	}
 
+	gate := tester.NewGate(set.SpeedConcurrency)
 	ch := make(chan model.Entry)
 	var wg sync.WaitGroup
-	workers := s.opt.TestConcurrency
+	workers := set.TestConcurrency
 	if workers > len(todo) {
 		workers = len(todo)
 	}
@@ -333,7 +356,7 @@ func (s *Service) runTests(ctx context.Context, entries []model.Entry, onlyUntes
 		go func() {
 			defer wg.Done()
 			for e := range ch {
-				s.testOne(ctx, e)
+				s.testOne(ctx, e, set, gate)
 			}
 		}()
 	}
@@ -353,7 +376,7 @@ feed:
 	}
 }
 
-func (s *Service) testOne(ctx context.Context, e model.Entry) {
+func (s *Service) testOne(ctx context.Context, e model.Entry, set settings.Settings, gate tester.Gate) {
 	defer func() {
 		if r := recover(); r != nil {
 			s.log.Error("test panicked", "panic", fmt.Sprint(r))
@@ -367,26 +390,64 @@ func (s *Service) testOne(ctx context.Context, e model.Entry) {
 	n, err := proxy.Parse(e.URI)
 	if err != nil {
 		now := time.Now().UTC()
-		res = model.TestResult{Tested: true, TestedAt: &now, Error: "invalid config: " + err.Error()}
+		res = model.TestResult{Tested: true, TestedAt: &now,
+			General: &model.Probe{Tested: true, Error: "invalid config: " + err.Error(), ErrorKind: model.ErrKindOther}}
+		res.SyncLegacy()
 	} else {
-		res = s.probe.Test(ctx, n)
+		res = s.probe.Test(ctx, n, set, gate)
 	}
-	if ctx.Err() != nil && !res.Reachable {
-		return // cancelled mid-test: keep the previous result
+	if ctx.Err() != nil {
+		return // cancelled mid-test: a partial result must not replace the previous one
 	}
 	s.st.SetTest(e.Key, res)
+
+	g, y, sp := res.General, res.YouTube, res.Speed
 	s.log.Debug("tested", "host", e.Host, "port", e.Port, "protocol", e.Protocol,
-		"reachable", res.Reachable, "latency_ms", res.LatencyMS, "error", res.Error)
+		"general", probeLog(g), "youtube", probeLog(y), "speed", speedLog(sp))
 	s.update(func(j *Job) {
 		j.TestDone++
-		if res.Reachable {
+		if g != nil && g.OK {
 			j.TestOK++
 		}
+		if y != nil && y.OK {
+			j.TestYT++
+		}
+		if sp != nil && sp.Tested {
+			j.TestSpeed++
+			if sp.OK {
+				j.TestSpeedOK++
+			}
+		}
+		if set.Eligible(res) {
+			j.TestElig++
+		}
 	})
-	if j := s.progress(); j%20 == 0 {
+	if s.progress()%20 == 0 {
 		if err := s.st.Flush(); err != nil {
 			s.log.Error("save test results", "error", err)
 		}
+	}
+}
+
+func probeLog(p *model.Probe) string {
+	switch {
+	case p == nil:
+		return "-"
+	case p.OK:
+		return fmt.Sprintf("ok %dms", p.LatencyMS)
+	default:
+		return p.ErrorKind
+	}
+}
+
+func speedLog(sp *model.Speed) string {
+	switch {
+	case sp == nil || !sp.Tested:
+		return "-"
+	case sp.OK:
+		return fmt.Sprintf("%.2fMbps", sp.Mbps)
+	default:
+		return sp.ErrorKind
 	}
 }
 

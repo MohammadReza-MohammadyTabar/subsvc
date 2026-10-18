@@ -88,8 +88,8 @@ sudo useradd --system --no-create-home --shell /usr/sbin/nologin subsvc
 sudo install -m 0755 bin/subsvc /usr/local/bin/subsvc
 
 sudo install -d -m 0750 -o root -g subsvc /etc/subsvc
-sudo install -m 0640 -o root -g subsvc deploy/config.example.json /etc/subsvc/config.json
-sudo sed -i "s/CHANGE-ME-to-a-long-random-string/$(openssl rand -hex 24)/" /etc/subsvc/config.json
+sudo install -m 0640 -o root -g subsvc deploy/subsvc.env.example /etc/subsvc/subsvc.env
+sudo sed -i "s/CHANGE-ME-openssl-rand-hex-24/$(openssl rand -hex 24)/" /etc/subsvc/subsvc.env
 
 sudo install -m 0644 deploy/subsvc.service /etc/systemd/system/subsvc.service
 sudo systemctl daemon-reload
@@ -106,27 +106,36 @@ curl -s http://127.0.0.1:8080/healthz        # ok
 
 داده‌ها در `/var/lib/subsvc` (`links.json`، `configs.json`) ذخیره می‌شوند و فایل‌ها `0600` هستند چون URL اشتراک‌ها معمولاً توکن محرمانه دارند. برای پشتیبان‌گیری همین دو فایل را کپی کنید.
 
-## پیکربندی (`/etc/subsvc/config.json`)
+## پیکربندی
 
-همه‌ی کلیدها اختیاری‌اند؛ مقدار پیش‌فرض در جدول آمده. کلید ناشناخته (غلط املایی) هنگام شروع خطا می‌دهد.
+**تنظیمات استقرار** با متغیرهای `SUBSVC_*` (در systemd از `/etc/subsvc/subsvc.env`) تعیین می‌شوند. اولویت: ENV ‏>‏ فایل قدیمی `-config` (فقط `listen`, `data_dir`, `auth_token`, `log_level`, `test.core_path`) ‏>‏ پیش‌فرض.
 
-| کلید | پیش‌فرض | توضیح |
+| متغیر | پیش‌فرض | توضیح |
 |---|---|---|
-| `listen` | `127.0.0.1:8080` | آدرس و پورت API |
-| `data_dir` | `/var/lib/subsvc` | محل فایل‌های ذخیره |
-| `auth_token` | خالی | اگر پر باشد همه‌ی درخواست‌ها (به‌جز `/healthz`) باید `Authorization: Bearer <token>` داشته باشند |
-| `log_level` | `info` | `debug` / `info` / `warn` / `error` |
-| `fetch_timeout_sec` | `20` | Timeout دریافت هر اشتراک (۱ تا ۳۰۰) |
-| `fetch_concurrency` | `2` | دریافت هم‌زمان اشتراک‌ها (۱ تا ۴) |
-| `max_body_bytes` | `10485760` | حداکثر حجم پاسخ اشتراک |
-| `user_agent` | `subsvc/1.0` | User-Agent دریافت اشتراک |
-| `test.url` | `https://www.google.com/generate_204` | آدرس تست |
-| `test.timeout_ms` | `5000` | Timeout هر کانفیگ (میلی‌ثانیه) |
-| `test.startup_timeout_ms` | `4000` | مهلت بالا‌آمدن هسته‌ی Xray |
-| `test.concurrency` | `2` | تست هم‌زمان؛ فقط `1` یا `2` |
-| `test.core_path` | `/usr/local/bin/xray` | مسیر Xray |
+| `SUBSVC_LISTEN` | `127.0.0.1:8080` | آدرس و پورت API؛ برای دسترسی از شبکه `0.0.0.0:8080` (یا هر پورت دلخواه) |
+| `SUBSVC_DATA_DIR` | `/var/lib/subsvc` | محل فایل‌های ذخیره |
+| `SUBSVC_AUTH_TOKEN` / `_FILE` | خالی | توکن Bearer؛ روی آدرس غیر loopback بدون توکن، یک توکن تصادفی در `<data_dir>/auth_token` ساخته می‌شود |
+| `SUBSVC_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
+| `SUBSVC_CORE_PATH` | `/usr/local/bin/xray` | مسیر Xray |
+| `SUBSVC_MAX_TEST_CONCURRENCY` | `20` | سقف هم‌زمانی قابل تنظیم از UI |
+| `SUBSVC_MAX_SPEED_BYTES` | `8388608` | سقف حجم تست سرعت |
 
-> **امنیت:** پیش‌فرض فقط روی `127.0.0.1` گوش می‌دهد. API فاقد TLS است؛ برای دسترسی از راه دور از تونل SSH (`ssh -L 8080:127.0.0.1:8080 server`) یا یک reverse proxy با TLS استفاده کنید و حتماً `auth_token` بگذارید. اگر روی آدرس غیر loopback بدون توکن اجرا شود، هشدار در لاگ ثبت می‌شود.
+**تنظیمات عملیاتی** (timeout ها، آدرس‌های تست عمومی/یوتیوب، هم‌زمانی، تست سرعت، معیار موفقیت و رتبه‌بندی) فقط از UI یا `GET/PUT /api/settings` تغییر می‌کنند و در `<data_dir>/settings.json` می‌مانند. تغییر روی تست بعدی اثر دارد و نیاز به ری‌استارت نیست.
+
+> **امنیت:** API فاقد TLS است؛ برای دسترسی از راه دور از تونل SSH یا reverse proxy با TLS استفاده کنید و توکن قوی بگذارید.
+
+### دسترسی از شبکه و عیب‌یابی
+
+```bash
+sudo nano /etc/subsvc/subsvc.env      # SUBSVC_LISTEN=0.0.0.0:8080  (یا پورت دلخواه)
+sudo systemctl restart subsvc
+sudo ufw allow 8080/tcp               # اگر فایروال فعال است
+sudo systemctl status subsvc          # اجرای دستی subsvc لازم نیست؛ سرویس از قبل بالاست
+sudo journalctl -u subsvc -f          # یا کاربر را به گروه systemd-journal اضافه کنید
+```
+
+اجرای دستی `subsvc` با کاربر عادی به‌خاطر دسترسی فایل تنظیمات خطای permission می‌دهد و با `sudo` هم چون سرویس همان پورت را گرفته «address already in use» می‌دهد.
+
 
 ## API
 
@@ -269,5 +278,5 @@ internal/store/        ذخیره‌ی JSON اتمیک (لینک‌ها و کا�
 internal/tester/       اجرای هسته، تست از طریق SOCKS5، اندازه‌گیری زمان
 internal/service/      کارهای refresh/test (یک کار در هر لحظه، لغو‌پذیر)
 internal/api/          هندلرهای HTTP (net/http)
-deploy/                subsvc.service و config.example.json
+deploy/                subsvc.service و subsvc.env.example
 ```
